@@ -1,0 +1,22 @@
+# ByteTrack config tuned for pan-tilt tracker (small number of persistent subjects)
+tracker_type: bytetrack
+
+# Raise track_buffer dramatically so a person who briefly drops out of detection
+# (occlusion, low confidence, momentary mis-detection) keeps their track ID rather
+# than being treated as a new person.  At ~33 fps inference: 150 frames ≈ 4.5 sec.
+track_buffer: 150
+
+# All our detections are pre-filtered at CONFIDENCE_THRESHOLD (0.5) before
+# reaching ByteTrack, so every detection ByteTrack sees is already "high".
+track_high_thresh: 0.25
+track_low_thresh: 0.10
+
+# Require a bit more confidence to spawn a brand-new track — reduces ghost tracks
+# for briefly occluded objects that ByteTrack misses and re-sees as new.
+new_track_thresh: 0.35
+
+# IoU / cost threshold for associating detections to existing tracks.
+# Slightly more lenient than default (0.8) for people who move fast or rotate.
+match_thresh: 0.75
+
+fuse_score: True

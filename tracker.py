@@ -1,0 +1,263 @@
+"""
+tracker.py — YOLOv8 + ByteTrack multi-person tracker with target selection.
+
+The Tracker owns its own YOLO model so detection and tracking happen
+in a single model.track() call (persist=True keeps IDs stable across frames).
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+import os
+import numpy as np
+import config
+
+# Prefer a local bytetrack.yaml so we can tune track_buffer and other params
+# without modifying the ultralytics package.
+_LOCAL_BYTETRACK = os.path.join(os.path.dirname(__file__), "bytetrack.yaml")
+_BYTETRACK_CFG   = _LOCAL_BYTETRACK if os.path.isfile(_LOCAL_BYTETRACK) else "bytetrack.yaml"
+
+
+# COCO pose keypoint indices (0-based)
+LEFT_SHOULDER  = 5
+RIGHT_SHOULDER = 6
+KEYPOINT_CONF_THRESH = 0.3
+
+
+@dataclass
+class Track:
+    track_id: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    conf: float
+    # Aim point: between shoulders when visible, else bbox center
+    aim_cx: float = 0.0
+    aim_cy: float = 0.0
+    # Pose keypoints: list of (x, y, conf) for 17 COCO points, or None
+    keypoints: list[tuple[float, float, float]] | None = None
+
+    @property
+    def cx(self) -> float:
+        return (self.x1 + self.x2) / 2.0
+
+    @property
+    def cy(self) -> float:
+        return (self.y1 + self.y2) / 2.0
+
+    @property
+    def area(self) -> float:
+        return (self.x2 - self.x1) * (self.y2 - self.y1)
+
+
+@dataclass
+class TrackResult:
+    tracks: list[Track] = field(default_factory=list)
+    target: Track | None = None
+    is_idle: bool = False
+    released_lock: bool = False  # True when tracker gave up on locked target
+
+
+class Tracker:
+    """
+    Wraps ultralytics YOLO.track() for combined detection + ByteTrack.
+
+    Target selection: always one person when visible.
+      - Keep current target if still in frame.
+      - Otherwise pick by highest confidence, then closest to centre.
+      - Idle after IDLE_TIMEOUT_FRAMES with no detections.
+    """
+
+    def __init__(self):
+        from ultralytics import YOLO
+        print(f"[Tracker] Loading model: {config.YOLO_MODEL_PATH}")
+        self._model = YOLO(config.YOLO_MODEL_PATH)
+        print("[Tracker] Model loaded.")
+
+        self._target_id:      int | None = None
+        self._lost_counter:   int = 0
+        self._idle_counter:   int = 0
+        self._no_det_counter: int = 0
+
+        # Manual slot lock: None = auto-select; int = left-to-right slot index
+        self._locked_slot:    int | None = None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def update(
+        self,
+        frame: np.ndarray,
+        frame_shape: tuple[int, int],
+        cycle_target_event=None,
+    ) -> TrackResult:
+        """Run detection + tracking on a BGR frame.
+
+        cycle_target_event: optional threading.Event that, when set, advances
+        the locked slot to the next person (left-to-right ordering).
+        """
+        h, w = frame_shape
+
+        results = self._model.track(
+            frame,
+            classes=[0],                         # person only
+            conf=config.CONFIDENCE_THRESHOLD,
+            persist=True,                        # maintains IDs across frames
+            tracker=_BYTETRACK_CFG,
+            imgsz=config.CAMERA_WIDTH,           # run inference at full camera resolution
+            verbose=False,
+        )
+
+        tracks = self._parse_results(results)
+
+        if not tracks:
+            self._no_det_counter += 1
+        else:
+            self._no_det_counter = 0
+
+        is_idle = self._no_det_counter >= config.IDLE_TIMEOUT_FRAMES
+
+        # Handle Tab cycle before target selection so the new slot is used this frame
+        if cycle_target_event is not None and cycle_target_event.is_set():
+            cycle_target_event.clear()
+            self._cycle_target(tracks)
+
+        target, released = self._select_target(tracks, w, h)
+        return TrackResult(tracks=tracks, target=target, is_idle=is_idle, released_lock=released)
+
+    def reset_target(self):
+        """Force re-acquisition on next frame."""
+        self._target_id    = None
+        self._locked_slot  = None
+        self._lost_counter = 0
+
+    def unlock_target(self):
+        """Release manual lock and return to auto-selection."""
+        self._locked_slot = None
+        self._target_id   = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _parse_results(self, results) -> list[Track]:
+        tracks: list[Track] = []
+        for r in results:
+            if r.boxes is None:
+                continue
+            boxes = r.boxes
+            if boxes.id is None:
+                continue
+            kpts = getattr(r, "keypoints", None)
+            for i in range(len(boxes)):
+                tid  = int(boxes.id[i])
+                x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+                conf = float(boxes.conf[i])
+                aim_cx, aim_cy = self._shoulder_midpoint(kpts, i) if kpts is not None else (None, None)
+                if aim_cx is not None and aim_cy is not None:
+                    pass  # use shoulder midpoint
+                else:
+                    aim_cx = (x1 + x2) / 2.0
+                    aim_cy = (y1 + y2) / 2.0
+                kp_list = self._extract_keypoints(kpts, i) if kpts is not None else None
+                tracks.append(Track(tid, x1, y1, x2, y2, conf, aim_cx=aim_cx, aim_cy=aim_cy, keypoints=kp_list))
+        return tracks
+
+    def _extract_keypoints(self, keypoints, idx: int) -> list[tuple[float, float, float]] | None:
+        """Extract (x, y, conf) for each of 17 COCO keypoints."""
+        if keypoints is None or keypoints.xy is None or idx >= len(keypoints.xy):
+            return None
+        xy = keypoints.xy[idx]
+        conf = keypoints.conf[idx] if keypoints.conf is not None else None
+        kp_list: list[tuple[float, float, float]] = []
+        for j in range(17):
+            x, y = float(xy[j][0]), float(xy[j][1])
+            c = float(conf[j]) if conf is not None else 1.0
+            kp_list.append((x, y, c))
+        return kp_list
+
+    def _shoulder_midpoint(self, keypoints, idx: int) -> tuple[float | None, float | None]:
+        """Return (cx, cy) between shoulders if both visible, else (None, None)."""
+        if keypoints is None or keypoints.xy is None or idx >= len(keypoints.xy):
+            return (None, None)
+        xy = keypoints.xy[idx]  # (17, 2)
+        conf = keypoints.conf[idx] if keypoints.conf is not None else None
+        ls = xy[LEFT_SHOULDER]
+        rs = xy[RIGHT_SHOULDER]
+        if conf is not None:
+            if conf[LEFT_SHOULDER] < KEYPOINT_CONF_THRESH and conf[RIGHT_SHOULDER] < KEYPOINT_CONF_THRESH:
+                return (None, None)
+            if conf[LEFT_SHOULDER] >= KEYPOINT_CONF_THRESH and conf[RIGHT_SHOULDER] >= KEYPOINT_CONF_THRESH:
+                return ((float(ls[0]) + float(rs[0])) / 2.0, (float(ls[1]) + float(rs[1])) / 2.0)
+            if conf[LEFT_SHOULDER] >= KEYPOINT_CONF_THRESH:
+                return (float(ls[0]), float(ls[1]))
+            return (float(rs[0]), float(rs[1]))
+        # No conf — assume visible if non-zero
+        return ((float(ls[0]) + float(rs[0])) / 2.0, (float(ls[1]) + float(rs[1])) / 2.0)
+
+    @staticmethod
+    def _ordered_tracks(tracks: list[Track]) -> list[Track]:
+        """Return tracks sorted left-to-right by aim_cx (stable slot ordering)."""
+        return sorted(tracks, key=lambda t: t.aim_cx)
+
+    def _cycle_target(self, tracks: list[Track]) -> None:
+        """Advance _locked_slot to the next position, wrapping around.
+
+        Called when the Tab key event fires.  If no one is visible yet,
+        do nothing — there's nothing to cycle to.
+        """
+        if not tracks:
+            return
+        n = len(tracks)
+        if self._locked_slot is None:
+            self._locked_slot = 0
+        else:
+            self._locked_slot = (self._locked_slot + 1) % n
+        # Reset auto-tracking state so the new selection takes effect cleanly
+        self._target_id   = None
+        self._lost_counter = 0
+        ordered = self._ordered_tracks(tracks)
+        print(f"[Tracker] Slot {self._locked_slot} locked → track {ordered[self._locked_slot].track_id}")
+
+    def _select_target(
+        self, tracks: list[Track], w: int, h: int
+    ) -> tuple[Track | None, bool]:
+        """Return (target, released_lock).
+
+        When _locked_slot is set, track the person at that left-to-right slot.
+        When no lock, auto-select closest to center (most stable default).
+        """
+        if not tracks:
+            self._lost_counter += 1
+            if self._locked_slot is not None:
+                # Locked person has left the frame — wait before giving up
+                if self._lost_counter >= config.TARGET_LOST_FRAMES:
+                    print("[Tracker] Locked target lost — reverting to auto.")
+                    self._locked_slot = None
+                    self._target_id   = None
+                    return (None, True)
+                return (None, False)
+            if self._lost_counter >= config.TARGET_LOST_FRAMES:
+                self._target_id = None
+            return (None, False)
+
+        self._lost_counter = 0
+        ordered = self._ordered_tracks(tracks)
+
+        # ── Manual slot lock ──
+        if self._locked_slot is not None:
+            # Clamp slot if people left the frame since Tab was pressed
+            slot = min(self._locked_slot, len(ordered) - 1)
+            target = ordered[slot]
+            self._target_id = target.track_id
+            return (target, False)
+
+        # ── Auto-select: closest to frame center, then highest confidence ──
+        cx, cy = w / 2.0, h / 2.0
+        best = min(tracks, key=lambda t: (
+            (t.aim_cx - cx) ** 2 + (t.aim_cy - cy) ** 2,
+            -t.conf,
+        ))
+        self._target_id = best.track_id
+        return (best, False)

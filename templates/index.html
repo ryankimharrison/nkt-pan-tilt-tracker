@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Pan-Tilt Tracker</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="app-header">
+    <h1><span class="accent">NKT</span> Pan-Tilt Tracker</h1>
+    <div class="conn-dot" id="conn-dot" title="Connection status"></div>
+  </header>
+
+  <div class="layout">
+    <!-- Live feed -->
+    <div class="feed-box">
+      <img id="feed" src="/video_feed" alt="Live feed" />
+    </div>
+
+    <!-- Controls -->
+    <div class="controls">
+
+      <!-- Status -->
+      <section>
+        <h2>Status</h2>
+        <div class="status-grid">
+          <div class="status-item">
+            <span class="status-label">State</span>
+            <span class="badge badge--idle" id="st-state">--</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Motor</span>
+            <span class="badge badge--off" id="st-motor">--</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">Fire</span>
+            <span class="badge badge--fire-off" id="st-fire">OFF</span>
+          </div>
+          <div class="status-item">
+            <span class="status-label">People</span>
+            <span class="badge badge--idle" id="st-people">0</span>
+          </div>
+        </div>
+        <div class="metric-row">
+          <span class="metric-item">Capture <strong id="st-fps-cap">--</strong></span>
+          <span class="metric-item">Inference <strong id="st-fps-inf">--</strong></span>
+          <span class="metric-item">Loop <strong id="st-fps-loop">--</strong></span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-item">Pan err <strong id="st-pan-err">--</strong></span>
+          <span class="metric-item">Tilt err <strong id="st-tilt-err">--</strong></span>
+        </div>
+        <div class="metric-row">
+          <span class="metric-item">Tilt Up <span class="badge badge--idle" id="st-tilt-up">--</span></span>
+          <span class="metric-item">Tilt Down <span class="badge badge--idle" id="st-tilt-down">--</span></span>
+        </div>
+      </section>
+
+      <!-- PD Gains -->
+      <section>
+        <h2>PD Gains</h2>
+        <div class="axis-tabs">
+          <button class="tab-btn active" onclick="switchAxis('pan', this)">Pan</button>
+          <button class="tab-btn"        onclick="switchAxis('tilt', this)">Tilt</button>
+        </div>
+
+        <div id="pan-sliders" class="axis-sliders">
+          <label>
+            <div class="slider-header"><span>Kp</span><span class="val" id="pan_kp_val">{{ params.pan_kp }}</span></div>
+            <input type="range" id="pan_kp" min="0" max="300" step="0.5"
+                   value="{{ params.pan_kp }}" oninput="onSlider(this,'pan_kp','pan_kp_val')" />
+          </label>
+          <label>
+            <div class="slider-header"><span>Kd</span><span class="val" id="pan_kd_val">{{ params.pan_kd }}</span></div>
+            <input type="range" id="pan_kd" min="0" max="100" step="0.5"
+                   value="{{ params.pan_kd }}" oninput="onSlider(this,'pan_kd','pan_kd_val')" />
+          </label>
+          <label>
+            <div class="slider-header"><span>Max vel (°/s)</span><span class="val" id="max_pan_vel_val">{{ params.max_pan_velocity }}</span></div>
+            <input type="range" id="max_pan_velocity" min="10" max="360" step="5"
+                   value="{{ params.max_pan_velocity }}" oninput="onSlider(this,'max_pan_velocity','max_pan_vel_val')" />
+          </label>
+        </div>
+
+        <div id="tilt-sliders" class="axis-sliders hidden">
+          <label>
+            <div class="slider-header"><span>Kp</span><span class="val" id="tilt_kp_val">{{ params.tilt_kp }}</span></div>
+            <input type="range" id="tilt_kp" min="0" max="300" step="0.5"
+                   value="{{ params.tilt_kp }}" oninput="onSlider(this,'tilt_kp','tilt_kp_val')" />
+          </label>
+          <label>
+            <div class="slider-header"><span>Kd</span><span class="val" id="tilt_kd_val">{{ params.tilt_kd }}</span></div>
+            <input type="range" id="tilt_kd" min="0" max="100" step="0.5"
+                   value="{{ params.tilt_kd }}" oninput="onSlider(this,'tilt_kd','tilt_kd_val')" />
+          </label>
+          <label>
+            <div class="slider-header"><span>Max vel (°/s)</span><span class="val" id="max_tilt_vel_val">{{ params.max_tilt_velocity }}</span></div>
+            <input type="range" id="max_tilt_velocity" min="10" max="180" step="5"
+                   value="{{ params.max_tilt_velocity }}" oninput="onSlider(this,'max_tilt_velocity','max_tilt_vel_val')" />
+          </label>
+        </div>
+      </section>
+
+      <!-- Shared sliders -->
+      <section>
+        <h2>Tracking</h2>
+        <label>
+          <div class="slider-header"><span>EMA Alpha</span><span class="val" id="ema_alpha_val">{{ params.ema_alpha }}</span></div>
+          <input type="range" id="ema_alpha" min="0.01" max="1" step="0.01"
+                 value="{{ params.ema_alpha }}" oninput="onSlider(this,'ema_alpha','ema_alpha_val')" />
+        </label>
+        <label>
+          <div class="slider-header"><span>Lead Gain</span><span class="val" id="lead_gain_val">{{ lead_gain }}</span></div>
+          <input type="range" id="lead_gain" min="0" max="20" step="0.5"
+                 value="{{ lead_gain }}" oninput="onSlider(this,'lead_gain','lead_gain_val')" />
+        </label>
+        <label>
+          <div class="slider-header"><span>Lead Accel</span><span class="val" id="lead_accel_gain_val">{{ lead_accel_gain }}</span></div>
+          <input type="range" id="lead_accel_gain" min="0" max="15" step="0.5"
+                 value="{{ lead_accel_gain }}" oninput="onSlider(this,'lead_accel_gain','lead_accel_gain_val')" />
+        </label>
+      </section>
+
+      <!-- Buttons -->
+      <section>
+        <h2>Control</h2>
+        <div class="btn-row">
+          <button class="btn-stop"   onclick="sendControl('estop')">E-STOP</button>
+          <button class="btn-normal" onclick="sendControl('recenter')">Re-center</button>
+          <button class="btn-normal" onclick="sendControl('toggle_motor')">Toggle Motor</button>
+        </div>
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn-stop" onclick="if(confirm('Shutdown? System will return to home and exit.')){sendControl('shutdown')}">SHUTDOWN</button>
+        </div>
+      </section>
+
+    </div><!-- /controls -->
+  </div><!-- /layout -->
+
+<script>
+function onSlider(el, param, valId) {
+  document.getElementById(valId).textContent = parseFloat(el.value).toFixed(2);
+  fetch('/params', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({[param]: parseFloat(el.value)})
+  });
+}
+
+function sendControl(action) {
+  fetch('/control', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action})
+  });
+}
+
+function switchAxis(axis, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('pan-sliders').classList.toggle('hidden',  axis !== 'pan');
+  document.getElementById('tilt-sliders').classList.toggle('hidden', axis !== 'tilt');
+}
+
+const connDot = document.getElementById('conn-dot');
+
+function pollStatus() {
+  fetch('/status').then(r => r.json()).then(s => {
+    connDot.classList.add('connected');
+
+    // State badge
+    const stateEl = document.getElementById('st-state');
+    const isOff = s.tracking_enabled === false;
+    stateEl.textContent = s.is_idle ? 'IDLE' : (isOff ? 'OFF' : 'TRACKING');
+    stateEl.className = 'badge ' + (s.is_idle ? 'badge--idle' : (isOff ? 'badge--off' : 'badge--tracking'));
+
+    // Motor badge
+    const motorEl = document.getElementById('st-motor');
+    motorEl.textContent = s.motor_enabled ? 'ON' : 'OFF';
+    motorEl.className = 'badge ' + (s.motor_enabled ? 'badge--on' : 'badge--off');
+
+    // Fire badge
+    const fireEl = document.getElementById('st-fire');
+    const fm = s.fire_mode || 'off';
+    fireEl.textContent = fm.toUpperCase();
+    fireEl.className = 'badge badge--fire-' + fm;
+
+    // People
+    const peopleEl = document.getElementById('st-people');
+    const pc = s.person_count || 0;
+    peopleEl.textContent = pc;
+    peopleEl.className = 'badge ' + (pc > 0 ? 'badge--tracking' : 'badge--idle');
+
+    // FPS
+    document.getElementById('st-fps-cap').textContent  = s.fps_capture;
+    document.getElementById('st-fps-inf').textContent  = s.fps_inference;
+    document.getElementById('st-fps-loop').textContent = s.fps_loop;
+
+    // Errors
+    document.getElementById('st-pan-err').textContent  = (s.pan_error  || 0).toFixed(3);
+    document.getElementById('st-tilt-err').textContent = (s.tilt_error || 0).toFixed(3);
+
+    // Tilt limits
+    const tiltUpEl = document.getElementById('st-tilt-up');
+    tiltUpEl.textContent = s.tilt_upper_calibrated ? 'SET' : 'NOT SET';
+    tiltUpEl.className = 'badge ' + (s.tilt_upper_calibrated ? 'badge--on' : 'badge--idle');
+
+    const tiltDownEl = document.getElementById('st-tilt-down');
+    tiltDownEl.textContent = s.tilt_lower_calibrated ? 'SET' : 'NOT SET';
+    tiltDownEl.className = 'badge ' + (s.tilt_lower_calibrated ? 'badge--on' : 'badge--idle');
+
+  }).catch(() => {
+    connDot.classList.remove('connected');
+  });
+  setTimeout(pollStatus, 500);
+}
+pollStatus();
+</script>
+</body>
+</html>
