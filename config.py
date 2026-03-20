@@ -52,11 +52,11 @@ SWAP_PAN_TILT = False
 # --------------- PD defaults ---------------
 # Pan axis
 PAN_KP  = 250.0
-PAN_KD  = 2.0
+PAN_KD  = 4.0
 
 # Tilt axis
 TILT_KP = 600.0
-TILT_KD = 2.0
+TILT_KD = 4.0
 
 # Maximum output velocity (deg/sec) before steps/sec conversion
 MAX_PAN_VELOCITY  = 1200.0
@@ -87,7 +87,7 @@ GAIN_CURVE_EXPONENT = 1.0
 # Exponential moving average on PID output (0 = no smoothing, 1 = frozen)
 # Higher = faster response; lower = more smoothing/lag.
 # Lower values give a natural acceleration ramp; 0.6–0.7 balances speed and smoothness.
-EMA_ALPHA = 0.65
+EMA_ALPHA = 0.85
 
 # --------------- Target management ---------------
 # Frames without seeing the tracked target before switching to nearest person
@@ -141,7 +141,7 @@ FIRE_AUTO_INTERVAL = 0.2
 # DISTANCE_GAIN_MAX: cap on the multiplier (prevents runaway on tiny detections).
 # Set DISTANCE_GAIN_REF_HEIGHT = 0.0 to disable.
 DISTANCE_GAIN_REF_HEIGHT = 0.35
-DISTANCE_GAIN_MAX        = 4.0
+DISTANCE_GAIN_MAX        = 8.0
 
 # --------------- Predictive lead ---------------
 # When a target is moving, add a lead offset to the aim point so the
@@ -149,11 +149,18 @@ DISTANCE_GAIN_MAX        = 4.0
 # LEAD_GAIN: how many frames ahead to aim (scales with target velocity).
 #   0.0 = disabled (pure reactive), 3.0 = lead by ~3 frames of target motion.
 # LEAD_EMA: smoothing on the velocity estimate (0.0–1.0, higher = less noise).
-SNAP_THRESHOLD  = 0.35   # normalized error above this → bypass EMA, instant snap
+SNAP_THRESHOLD  = 0.08   # normalized error above this → bypass EMA, instant snap
 
-LEAD_GAIN       = 0.0    # frames ahead to aim (velocity-based)
-LEAD_ACCEL_GAIN = 0.0    # extra frames ahead from acceleration
-LEAD_EMA        = 0.4    # velocity estimate smoothing (higher = more responsive)
+LEAD_GAIN       = 0.0    # (legacy, unused) frames ahead to aim
+LEAD_ACCEL_GAIN = 0.0    # (legacy, unused)
+LEAD_EMA        = 0.4    # (legacy, unused)
+
+# --------------- Latency-compensating prediction ---------------
+PREDICTION_ENABLED    = True
+PREDICTION_VEL_ALPHA  = 0.7    # velocity EMA (higher = more responsive, noisier)
+PREDICTION_EXTRA_MS   = 40     # assumed inference latency added to measured frame age
+PREDICTION_MAX_SEC    = 0.15   # cap prediction horizon (prevents runaway overshoot)
+PREDICTION_MIN_FRAMES = 3      # frames of stable velocity before prediction kicks in
 
 # --------------- Auto-brightness ---------------
 # Hardware: ask the camera driver to manage exposure automatically.

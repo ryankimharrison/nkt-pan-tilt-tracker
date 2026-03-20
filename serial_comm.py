@@ -152,11 +152,10 @@ class SerialComm:
             self._send_raw(cmd)
 
     def enable_motors(self) -> bool:
-        """Send E0 and wait for OK. Returns True on success."""
+        """Send E0 (fire-and-forget for minimal latency)."""
         with self._lock:
             self._send_raw(b"E0\n")
-            ok = self._wait_reply(b"OK")
-        return ok
+        return True
 
     def disable_motors(self) -> bool:
         """Send E1 and wait for OK. Returns True on success."""

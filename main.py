@@ -32,6 +32,7 @@ Trackbars (OpenCV window, labeled by axis)
 from __future__ import annotations
 
 import atexit
+import collections
 import signal
 import sys
 import threading
@@ -59,6 +60,7 @@ class SharedState:
     def __init__(self):
         self.frame_lock      = threading.Lock()
         self.latest_frame    = None
+        self.latest_frame_time = 0.0
 
         self.annotated_lock  = threading.Lock()
         self.annotated_frame = None
@@ -189,7 +191,56 @@ def _capture_thread(cap: cv2.VideoCapture, fps_counter: FPSCounter):
         fps_counter.tick()
         with shared.frame_lock:
             shared.latest_frame = frame
+            shared.latest_frame_time = time.perf_counter()
     print("[Capture] Thread stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Annotation thread — draws overlays off the critical processing path
+# ---------------------------------------------------------------------------
+
+_annotation_queue: collections.deque = collections.deque(maxlen=1)
+
+
+def _annotation_thread(psl: "PSLAnalyzer"):
+    """Reads annotation jobs from a single-slot deque and writes to shared.annotated_frame."""
+    print("[Annotation] Thread started.")
+    while not shared.stop_event.is_set():
+        try:
+            job = _annotation_queue.popleft()
+        except IndexError:
+            time.sleep(0.002)
+            continue
+
+        try:
+            ann = annotator.annotate(**job["annotate_kwargs"])
+            draw_psl_overlay(ann, psl.get_result(), analyzer=psl)
+
+            # Pin 12 fire indicator
+            p12 = job.get("pin12")
+            if p12:
+                fh, fw = ann.shape[:2]
+                label, colour = p12["label"], p12["colour"]
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, 0.65, 2)
+                tx = (fw - tw) // 2
+                ty = fh - 22
+                cv2.rectangle(ann, (tx - 10, ty - th - 6),
+                              (tx + tw + 10, ty + 6), (0, 0, 0), -1)
+                cv2.rectangle(ann, (tx - 10, ty - th - 6),
+                              (tx + tw + 10, ty + 6), colour, 2)
+                cv2.putText(ann, label, (tx, ty),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.65, colour, 2, cv2.LINE_AA)
+
+            with shared.annotated_lock:
+                shared.annotated_frame = ann
+        except Exception as _e:
+            import traceback
+            print(f"[Annotation] Error: {_e}")
+            traceback.print_exc()
+            with shared.annotated_lock:
+                shared.annotated_frame = job["annotate_kwargs"]["frame"].copy()
+
+    print("[Annotation] Thread stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -243,16 +294,14 @@ def _processing_thread(
     _center_deenergized = False  # True when de-energized due to centre-idle
     _pin12_state        = False  # last known state of Arduino pin 12
     _last_fire_source   = "auto" # "auto" | "space" — label for the FIRE banner
-    # Predictive lead: track aim point velocity for lead compensation
-    _prev_aim_cx  = 0.0
-    _prev_aim_cy  = 0.0
-    _aim_vel_x    = 0.0   # EMA-smoothed aim point velocity (px/frame)
-    _aim_vel_y    = 0.0
-    _aim_accel_x  = 0.0   # EMA-smoothed aim point acceleration (px/frame²)
-    _aim_accel_y  = 0.0
-    _prev_vel_x   = 0.0
-    _prev_vel_y   = 0.0
-    _had_target   = False
+    # Latency-compensating prediction state
+    _prev_aim_cx    = 0.0
+    _prev_aim_cy    = 0.0
+    _prev_detect_t  = 0.0              # perf_counter time of previous detection
+    _vel_px_x       = 0.0              # EMA-smoothed velocity in px/sec
+    _vel_px_y       = 0.0
+    _had_target     = False
+    _vel_stable_cnt = 0                # frames of stable velocity
 
     # Hand/head position control state
     _hh_pos_initialized = False
@@ -305,6 +354,7 @@ def _processing_thread(
         # ── grab latest frame (single source: display shows exactly what detector sees) ──
         with shared.frame_lock:
             frame = shared.latest_frame
+            _frame_time = shared.latest_frame_time
         if frame is None:
             time.sleep(0.001)
             continue
@@ -342,44 +392,50 @@ def _processing_thread(
         pan_error = tilt_error = pan_vel = tilt_vel = 0.0
 
         if target is not None and shared.tracking_enabled:
-            # Predictive lead: offset aim point by velocity + acceleration
+            # ── Latency-compensating prediction ──
+            _now_t = time.perf_counter()
             if _had_target:
-                raw_vx = target.aim_cx - _prev_aim_cx
-                raw_vy = target.aim_cy - _prev_aim_cy
-                _alpha = config.LEAD_EMA
-                _aim_vel_x = _alpha * raw_vx + (1 - _alpha) * _aim_vel_x
-                _aim_vel_y = _alpha * raw_vy + (1 - _alpha) * _aim_vel_y
-                # Acceleration: rate of change of velocity
-                raw_ax = _aim_vel_x - _prev_vel_x
-                raw_ay = _aim_vel_y - _prev_vel_y
-                _aim_accel_x = _alpha * raw_ax + (1 - _alpha) * _aim_accel_x
-                _aim_accel_y = _alpha * raw_ay + (1 - _alpha) * _aim_accel_y
+                dt_detect = _now_t - _prev_detect_t
+                if dt_detect > 0.001:
+                    raw_vx = (target.aim_cx - _prev_aim_cx) / dt_detect
+                    raw_vy = (target.aim_cy - _prev_aim_cy) / dt_detect
+                    _a = config.PREDICTION_VEL_ALPHA
+                    _vel_px_x = _a * raw_vx + (1 - _a) * _vel_px_x
+                    _vel_px_y = _a * raw_vy + (1 - _a) * _vel_px_y
+                    _vel_stable_cnt += 1
             else:
-                _aim_vel_x = 0.0
-                _aim_vel_y = 0.0
-                _aim_accel_x = 0.0
-                _aim_accel_y = 0.0
-            _prev_aim_cx = target.aim_cx
-            _prev_aim_cy = target.aim_cy
-            _prev_vel_x = _aim_vel_x
-            _prev_vel_y = _aim_vel_y
-            _had_target = True
+                _vel_px_x = 0.0
+                _vel_px_y = 0.0
+                _vel_stable_cnt = 0
+            _prev_aim_cx   = target.aim_cx
+            _prev_aim_cy   = target.aim_cy
+            _prev_detect_t = _now_t
+            _had_target    = True
 
-            # Lead = velocity * gain + 0.5 * acceleration * gain²
-            _lg = config.LEAD_GAIN
-            _ag = config.LEAD_ACCEL_GAIN
-            lead_cx = target.aim_cx + _aim_vel_x * _lg + _aim_accel_x * _ag
-            lead_cy = target.aim_cy + _aim_vel_y * _lg + _aim_accel_y * _ag
+            # Predict forward by measured pipeline latency
+            aim_cx = target.aim_cx
+            aim_cy = target.aim_cy
+            if config.PREDICTION_ENABLED and _vel_stable_cnt >= config.PREDICTION_MIN_FRAMES:
+                frame_age = max(0.0, _now_t - _frame_time) if _frame_time > 0 else 0.0
+                predict_sec = frame_age + config.PREDICTION_EXTRA_MS / 1000.0
+                predict_sec = min(predict_sec, config.PREDICTION_MAX_SEC)
+                aim_cx += _vel_px_x * predict_sec
+                aim_cy += _vel_px_y * predict_sec
 
-            pan_error  = (lead_cx - w / 2.0) / (w / 2.0)
-            tilt_error = (lead_cy - h / 2.0) / (h / 2.0)
+            pan_error  = (aim_cx - w / 2.0) / (w / 2.0)
+            tilt_error = (aim_cy - h / 2.0) / (h / 2.0)
 
             # Distance-adaptive gain: boost error when target is far (small box)
+            # Soft rolloff above 4x to prevent gain discontinuity at distance
             if config.DISTANCE_GAIN_REF_HEIGHT > 0.0:
                 _bbox_h_frac = (target.y2 - target.y1) / h
                 if _bbox_h_frac > 0.01:
-                    _dist_scale  = min(config.DISTANCE_GAIN_MAX,
-                                       config.DISTANCE_GAIN_REF_HEIGHT / _bbox_h_frac)
+                    _raw_scale = config.DISTANCE_GAIN_REF_HEIGHT / _bbox_h_frac
+                    if _raw_scale <= 4.0:
+                        _dist_scale = _raw_scale
+                    else:
+                        _dist_scale = 4.0 + (_raw_scale - 4.0) ** 0.5
+                    _dist_scale = min(_dist_scale, config.DISTANCE_GAIN_MAX)
                     pan_error   *= _dist_scale
                     tilt_error  *= _dist_scale
 
@@ -398,7 +454,6 @@ def _processing_thread(
                     serial.enable_motors()
                     shared.motor_enabled = True
                     _center_deenergized = False
-                    time.sleep(config.MOTOR_ENABLE_DELAY_MS / 1000.0)
                     print("[Processing] Target acquired — motors enabled.")
                 else:
                     pan_vel = tilt_vel = 0.0
@@ -422,12 +477,9 @@ def _processing_thread(
             centered_frames = 0
             _center_deenergized = False
             _had_target = False
-            _aim_vel_x = 0.0
-            _aim_vel_y = 0.0
-            _aim_accel_x = 0.0
-            _aim_accel_y = 0.0
-            _prev_vel_x = 0.0
-            _prev_vel_y = 0.0
+            _vel_px_x = 0.0
+            _vel_px_y = 0.0
+            _vel_stable_cnt = 0
 
         # ── manual jog overrides PID; hand/head overrides PID too ──
         jog = shared.manual_jog
@@ -568,68 +620,47 @@ def _processing_thread(
         # ── PSL: feed raw frame (isolated thread does the heavy lifting) ──
         psl.push_frame(frame)
 
-        # ── annotate frame (camera view + right panel) ──
-        try:
-            params = controller.get_params()
-            annotated = annotator.annotate(
-                frame=frame,
-                tracks=tracks,
-                target=target,
-                pan_error=pan_error,
-                tilt_error=tilt_error,
-                pan_vel=pan_vel,
-                tilt_vel=tilt_vel,
-                deadzone=controller.pan.deadzone,
-                fps_capture=fps_capture.get(),
-                fps_inference=fps_inference.get(),
-                fps_loop=fps_loop.get(),
-                person_count=len(tracks),
-                motor_enabled=shared.motor_enabled,
-                is_idle=is_idle,
-                pan_steps_sec=pan_sps,
-                tilt_steps_sec=tilt_sps,
-                params=params,
-                fire_mode=shared.fire_mode,
-                is_firing=_pin12_state,
-                tracking_enabled=shared.tracking_enabled,
-                in_fire_zone=_in_fire_zone,
-                locked_slot=tracker._locked_slot,
-                tilt_upper_calibrated=shared.tilt_upper_calibrated,
-                tilt_lower_calibrated=shared.tilt_lower_calibrated,
-                limits_calibrated=shared.limits_calibrated,
-                control_source=shared.control_source,
-            )
-            draw_psl_overlay(annotated, psl.get_result(), analyzer=psl)
-        except Exception as _e:
-            import traceback
-            print(f"[Processing] Annotation/PSL error: {_e}")
-            traceback.print_exc()
-            annotated = frame.copy()
+        # ── push annotation job to background thread (off critical path) ──
+        params = controller.get_params()
+        _ann_job: dict = {
+            "annotate_kwargs": {
+                "frame": frame,
+                "tracks": tracks,
+                "target": target,
+                "pan_error": pan_error,
+                "tilt_error": tilt_error,
+                "pan_vel": pan_vel,
+                "tilt_vel": tilt_vel,
+                "deadzone": controller.pan.deadzone,
+                "fps_capture": fps_capture.get(),
+                "fps_inference": fps_inference.get(),
+                "fps_loop": fps_loop.get(),
+                "person_count": len(tracks),
+                "motor_enabled": shared.motor_enabled,
+                "is_idle": is_idle,
+                "pan_steps_sec": pan_sps,
+                "tilt_steps_sec": tilt_sps,
+                "params": params,
+                "fire_mode": shared.fire_mode,
+                "is_firing": _pin12_state,
+                "tracking_enabled": shared.tracking_enabled,
+                "in_fire_zone": _in_fire_zone,
+                "locked_slot": tracker._locked_slot,
+                "tilt_upper_calibrated": shared.tilt_upper_calibrated,
+                "tilt_lower_calibrated": shared.tilt_lower_calibrated,
+                "limits_calibrated": shared.limits_calibrated,
+                "control_source": shared.control_source,
+            },
+        }
 
-        # ── pin 12 indicator ──
         if _pin12_state:
-            fh, fw = annotated.shape[:2]
             if shared.pin12_manual:
-                _p12_label  = "FIRE  [N-OVERRIDE]"
-                _p12_colour = (0, 165, 255)
+                _ann_job["pin12"] = {"label": "FIRE  [N-OVERRIDE]", "colour": (0, 165, 255)}
             elif _last_fire_source == "space":
-                _p12_label  = "FIRE  [\u25a0SPACE]"
-                _p12_colour = (0, 200, 255)
+                _ann_job["pin12"] = {"label": "FIRE  [\u25a0SPACE]", "colour": (0, 200, 255)}
             else:
-                _p12_label  = "FIRE  [AUTO]"
-                _p12_colour = (0, 0, 220)
-            (_tw, _th), _ = cv2.getTextSize(_p12_label, cv2.FONT_HERSHEY_DUPLEX, 0.65, 2)
-            _tx = (fw - _tw) // 2
-            _ty = fh - 22
-            cv2.rectangle(annotated, (_tx - 10, _ty - _th - 6),
-                          (_tx + _tw + 10, _ty + 6), (0, 0, 0), -1)
-            cv2.rectangle(annotated, (_tx - 10, _ty - _th - 6),
-                          (_tx + _tw + 10, _ty + 6), _p12_colour, 2)
-            cv2.putText(annotated, _p12_label, (_tx, _ty),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.65, _p12_colour, 2, cv2.LINE_AA)
-
-        with shared.annotated_lock:
-            shared.annotated_frame = annotated
+                _ann_job["pin12"] = {"label": "FIRE  [AUTO]", "colour": (0, 0, 220)}
+        _annotation_queue.append(_ann_job)
 
         # ── status for Flask UI ──
         with shared.status_lock:
@@ -1223,6 +1254,15 @@ def main():
         name="Processing",
     )
     proc_thread.start()
+
+    # ── Thread 3: Annotation (background, off critical path) ──
+    ann_thread = threading.Thread(
+        target=_annotation_thread,
+        args=(psl,),
+        daemon=True,
+        name="Annotation",
+    )
+    ann_thread.start()
 
     # ── Main thread: OpenCV display + trackbars + keyboard ──
     _display_loop(controller)
