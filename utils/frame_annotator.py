@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 from collections import deque
 from PIL import Image, ImageDraw, ImageFont
+import config
 
 # COCO pose skeleton connections (0-indexed)
 _COCO_SKELETON = [
@@ -258,6 +259,16 @@ def annotate(
     tilt_lower_calibrated: bool = False,
     limits_calibrated:     bool = False,
     control_source:        str  = "pid",
+    est_distance_m:        float = 0.0,
+    waypoints_world:       list | None = None,
+    waypoint_current_idx:  int  = -1,
+    waypoint_mode:         bool = False,
+    turret_pan_deg:        float = 0.0,
+    turret_tilt_deg:       float = 0.0,
+    cal_active:            bool = False,
+    cal_click_px:          tuple | None = None,
+    ballistic_lead_px:     tuple = (0.0, 0.0),
+    ballistic_active:      bool = False,
 ) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
@@ -323,6 +334,27 @@ def annotate(
     cv2.circle(out, (_cx, _cy), 3, _ORANGE, -1, cv2.LINE_AA)
     cv2.circle(out, (_cx, _cy), 3, _BLACK, 1, cv2.LINE_AA)
 
+    # Ballistic lead reticle — shows where darts will be aimed
+    if ballistic_active and config.BALLISTIC_SHOW_RETICLE:
+        _bl_x = int(_cx + ballistic_lead_px[0])
+        _bl_y = int(_cy + ballistic_lead_px[1])
+        _bl_x = max(10, min(w - 10, _bl_x))
+        _bl_y = max(10, min(h - 10, _bl_y))
+        # Lead reticle: diamond shape in cyan
+        _LEAD_CLR = (255, 255, 0)  # cyan BGR
+        _sz = 12
+        pts = np.array([
+            [_bl_x, _bl_y - _sz], [_bl_x + _sz, _bl_y],
+            [_bl_x, _bl_y + _sz], [_bl_x - _sz, _bl_y],
+        ], dtype=np.int32)
+        cv2.polylines(out, [pts], True, _LEAD_CLR, 2, cv2.LINE_AA)
+        cv2.circle(out, (_bl_x, _bl_y), 3, _LEAD_CLR, -1, cv2.LINE_AA)
+        # Line from crosshair center to lead point
+        cv2.line(out, (_cx, _cy), (_bl_x, _bl_y), _LEAD_CLR, 1, cv2.LINE_AA)
+        # Label
+        cv2.putText(out, "LEAD", (_bl_x + 14, _bl_y - 4),
+                    _CV_FONT, 0.4, _LEAD_CLR, 1, cv2.LINE_AA)
+
     # Fire zone + deadzone
     if target is not None:
         dz_cx, dz_cy = int(target.aim_cx), int(target.aim_cy)
@@ -349,6 +381,45 @@ def annotate(
         cv2.circle(out, (tcx, tcy), 6, _BLACK,  1)
         cv2.arrowedLine(out, (cx_frame, cy_frame), (tcx, tcy), _ORANGE, 1,
                         cv2.LINE_AA, tipLength=0.15)
+
+    # Waypoint dots — project from world angles to current pixel positions
+    _wp_px_list = []
+    if waypoints_world:
+        _ppx = config.CAMERA_PAN_DEG_PER_PX
+        _tpx = config.CAMERA_TILT_DEG_PER_PX
+        for i, (wp_pan, wp_tilt) in enumerate(waypoints_world):
+            # Offset from current turret position → pixel offset from center
+            _d_pan  = wp_pan  - turret_pan_deg
+            _d_tilt = wp_tilt - turret_tilt_deg
+            # Invert back to pixel space if axis is inverted
+            if config.PAN_INVERT:
+                _d_pan = -_d_pan
+            if config.TILT_INVERT:
+                _d_tilt = -_d_tilt
+            px_x = int(w / 2.0 + _d_pan  / _ppx) if _ppx > 0 else cx_frame
+            px_y = int(h / 2.0 + _d_tilt / _tpx) if _tpx > 0 else cy_frame
+            _wp_px_list.append((px_x, px_y))
+            # Only draw if on-screen
+            if 0 <= px_x < w and 0 <= px_y < h:
+                if i < waypoint_current_idx:
+                    color = (0, 200, 0)      # green = done
+                elif i == waypoint_current_idx:
+                    color = (0, 165, 255)    # orange = current target
+                else:
+                    color = (0, 0, 255)      # red = pending
+                cv2.circle(out, (px_x, px_y), 10, _BLACK, -1)
+                cv2.circle(out, (px_x, px_y), 9, color, -1)
+                cv2.circle(out, (px_x, px_y), 10, _BLACK, 1)
+                cv2.putText(out, str(i + 1), (px_x - 5, px_y + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+        # Connecting lines
+        for i in range(len(_wp_px_list) - 1):
+            cv2.line(out, _wp_px_list[i], _wp_px_list[i + 1], (0, 0, 180), 1, cv2.LINE_AA)
+
+    # Calibration crosshair on clicked point
+    if cal_active and cal_click_px is not None:
+        cx_cal, cy_cal = cal_click_px
+        cv2.drawMarker(out, (cx_cal, cy_cal), (0, 255, 255), cv2.MARKER_CROSS, 30, 2)
 
     # Frame border
     _draw_frame_border(out, w, h)
@@ -506,6 +577,10 @@ def annotate(
         ("Algorithm: Predictive AI",                                     _WHITE_RGB,   False),
         (f"Deadzone:  {deadzone:.3f}",                                    _WHITE_RGB,   False),
         (f"EMA:       {p.get('ema_alpha',0):.2f}",                       _WHITE_RGB,   False),
+        (f"Distance:  {est_distance_m:.1f}m [{('CLOSE' if est_distance_m < config.DISTANCE_CLOSE_M else ('FAR' if est_distance_m > config.DISTANCE_FAR_M else 'MEDIUM')) if est_distance_m > 0 else 'N/A'}]",
+         (_SUCCESS_RGB if est_distance_m > 0 and est_distance_m < config.DISTANCE_CLOSE_M else (_RED_RGB if est_distance_m > config.DISTANCE_FAR_M else _WARNING_RGB)) if est_distance_m > 0 else _GRAY_RGB, False),
+        (f"Waypoint:  {'EXEC ' + str(waypoint_current_idx + 1) + '/' + str(len(waypoints_world)) if waypoints_world and waypoint_current_idx >= 0 else (str(len(waypoints_world)) + ' placed' if waypoints_world else 'OFF')}" if waypoint_mode else "",
+         _ORANGE_RGB if waypoint_mode else _WHITE_RGB, False),
         ("",                                                             _WHITE_RGB,   False),
         ("LOCK STATUS",                                                  _ORANGE_RGB,  True),
         (f"System:  {'TRACKING' if tracking_enabled and not is_idle else ('STANDBY' if is_idle else 'OFFLINE')}",
@@ -535,8 +610,8 @@ def annotate(
     _pil_draw_shadow_text(draw, _leg_lx + 36, _gy_base - 14, "TILT", _F12, (0, 200, 255))
 
     # ── Bottom legend ──
-    leg1 = "[W/A/S/D] Move Camera   [T] Toggle Tracking   [Tab] Next Target   [F] Fire Mode   [L] Set Boundaries   [I] System Info"
-    leg2 = "[Space] Manual Fire   [N] Force Engage   [H] Hand/Head Control   [E] Emergency Shutoff   [R] Re-center   [Z] Reset Axes   [Q] Exit"
+    leg1 = "[W/A/S/D] Move Camera   [T] Toggle Tracking   [Tab] Next Target   [F] Fire Mode   [P] Ballistic Lead   [L] Set Boundaries   [I] System Info"
+    leg2 = "[Space] Manual Fire   [N] Force Engage   [H] Hand/Head   [E] Emergency Shutoff   [R] Re-center   [Z] Reset Axes   [V] Waypoint   [Q] Exit"
     draw.text((16, leg_y0 + 4), leg1, font=_F12, fill=(*_GRAY_RGB, 220))
     draw.text((16, leg_y0 + 19), leg2, font=_F12, fill=(*_GRAY_RGB, 220))
 

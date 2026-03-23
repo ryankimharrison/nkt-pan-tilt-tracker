@@ -22,6 +22,13 @@ SERIAL_BAUD = 115200
 # --------------- Detection ---------------
 # Use pose model for shoulder-based aiming (yolov8n-pose.pt).
 # Falls back to bbox center if shoulders not visible.
+# Camera-to-turret calibration (degrees per pixel)
+# Run calibration (B key in waypoint mode) to set these accurately.
+# Defaults assume ~60° HFOV on 1280px wide frame.
+CAMERA_PAN_DEG_PER_PX  = 60.0 / 1280.0   # ~0.047
+CAMERA_TILT_DEG_PER_PX = 33.75 / 720.0   # ~0.047 (derived from aspect ratio)
+CAMERA_CALIBRATED      = False            # True after running B-key calibration
+
 YOLO_MODEL_PATH        = "yolov8n-pose.pt"
 CONFIDENCE_THRESHOLD   = 0.5
 
@@ -50,16 +57,19 @@ TILT_ENABLED = True
 SWAP_PAN_TILT = False
 
 # --------------- PD defaults ---------------
-# Pan axis
-PAN_KP  = 250.0
-PAN_KD  = 4.0
+# Pan axis (helical gear, 98:18 ratio, 1/8 microstep)
+# Arduino ceiling: 15000 sps = ~621 deg/sec camera-side.
+PAN_KP  = 167.0    # user-tuned value
+PAN_KD  = 8.0      # was 4 — scaled with Kp to maintain damping ratio
 
-# Tilt axis
+# Tilt axis (20:1 worm gear, full step)
+# Arduino ceiling: 8000 sps = ~720 deg/sec motor = 36 deg/sec camera.
 TILT_KP = 600.0
-TILT_KD = 4.0
+TILT_KD = 6.0      # was 4 — slightly more damping for worm gear rigidity
 
 # Maximum output velocity (deg/sec) before steps/sec conversion
-MAX_PAN_VELOCITY  = 1200.0
+# Pan capped to match Arduino PAN_MAX_SPEED (15000 sps → ~621 deg/sec)
+MAX_PAN_VELOCITY  = 600.0
 MAX_TILT_VELOCITY = 300.0
 
 # --------------- Deadzone ---------------
@@ -87,7 +97,7 @@ GAIN_CURVE_EXPONENT = 1.0
 # Exponential moving average on PID output (0 = no smoothing, 1 = frozen)
 # Higher = faster response; lower = more smoothing/lag.
 # Lower values give a natural acceleration ramp; 0.6–0.7 balances speed and smoothness.
-EMA_ALPHA = 0.85
+EMA_ALPHA = 0.92    # near-instant response; Kd provides damping instead of EMA
 
 # --------------- Target management ---------------
 # Frames without seeing the tracked target before switching to nearest person
@@ -170,6 +180,19 @@ PREDICTION_VEL_ALPHA  = 0.7    # velocity EMA (higher = more responsive, noisier
 PREDICTION_EXTRA_MS   = 40     # assumed inference latency added to measured frame age
 PREDICTION_MAX_SEC    = 0.15   # cap prediction horizon (prevents runaway overshoot)
 PREDICTION_MIN_FRAMES = 3      # frames of stable velocity before prediction kicks in
+
+# --------------- Ballistic lead (projectile compensation) ---------------
+# Shifts the aim point ahead of a moving target to compensate for dart flight time.
+# Only active when BALLISTIC_LEAD_ENABLED is True AND fire mode is not "off".
+# Uses a separate slow velocity EMA to avoid jitter-induced aim scatter.
+BALLISTIC_LEAD_ENABLED   = False   # master toggle (P key opens settings window)
+DART_SPEED_MPS           = 25.0    # Nerf dart muzzle velocity (m/s)
+BALLISTIC_VEL_ALPHA      = 0.3     # slow EMA for lead velocity (lower = more stable)
+BALLISTIC_BLEND_TIME     = 0.20    # seconds to ramp lead in/out (prevents jerk)
+BALLISTIC_MIN_STABILITY  = 5       # frames of stable velocity before lead activates
+BALLISTIC_MAX_LEAD_PX    = 120     # max lead offset in pixels (safety clamp)
+BALLISTIC_GRAVITY_COMP   = True    # compensate for dart drop (tilt up slightly)
+BALLISTIC_SHOW_RETICLE   = True    # draw lead reticle on HUD
 
 # --------------- Auto-brightness ---------------
 # Hardware: ask the camera driver to manage exposure automatically.
