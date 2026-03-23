@@ -24,9 +24,9 @@ SERIAL_BAUD = 115200
 # Falls back to bbox center if shoulders not visible.
 # Camera-to-turret calibration (degrees per pixel)
 # Run calibration (B key in waypoint mode) to set these accurately.
-# Defaults assume ~60° HFOV on 1280px wide frame.
-CAMERA_PAN_DEG_PER_PX  = 60.0 / 1280.0   # ~0.047
-CAMERA_TILT_DEG_PER_PX = 33.75 / 720.0   # ~0.047 (derived from aspect ratio)
+# SVPRO camera has ~120° HFOV on 1280px wide frame.
+CAMERA_PAN_DEG_PER_PX  = 120.0 / 1280.0   # ~0.094 (120° HFOV)
+CAMERA_TILT_DEG_PER_PX = 67.5 / 720.0    # ~0.094 (derived from 16:9 aspect ratio)
 CAMERA_CALIBRATED      = False            # True after running B-key calibration
 
 YOLO_MODEL_PATH        = "yolov8n-pose.pt"
@@ -186,12 +186,17 @@ PREDICTION_MIN_FRAMES = 3      # frames of stable velocity before prediction kic
 # Only active when BALLISTIC_LEAD_ENABLED is True AND fire mode is not "off".
 # Uses a separate slow velocity EMA to avoid jitter-induced aim scatter.
 BALLISTIC_LEAD_ENABLED   = False   # master toggle (P key opens settings window)
-DART_SPEED_MPS           = 25.0    # Nerf dart muzzle velocity (m/s)
-BALLISTIC_VEL_ALPHA      = 0.3     # slow EMA for lead velocity (lower = more stable)
+DART_SPEED_MPS           = 60.0    # dart muzzle velocity (m/s)
+DART_MASS_KG             = 0.0002  # 0.2 grams
+DART_DIAMETER_M          = 0.008   # 8mm sphere model
+DART_CD                  = 0.47    # drag coefficient (sphere)
+AIR_DENSITY              = 1.225   # kg/m³ at sea level
+BALLISTIC_VEL_ALPHA      = 0.08    # very slow EMA for lead velocity (lower = more stable, less jitter)
 BALLISTIC_BLEND_TIME     = 0.20    # seconds to ramp lead in/out (prevents jerk)
-BALLISTIC_MIN_STABILITY  = 5       # frames of stable velocity before lead activates
+BALLISTIC_MIN_STABILITY  = 15      # frames of stable velocity before lead activates
 BALLISTIC_MAX_LEAD_PX    = 120     # max lead offset in pixels (safety clamp)
 BALLISTIC_GRAVITY_COMP   = True    # compensate for dart drop (tilt up slightly)
+BALLISTIC_DRAG_MODEL     = True    # use drag deceleration model (more accurate flight time)
 BALLISTIC_SHOW_RETICLE   = True    # draw lead reticle on HUD
 
 # --------------- Auto-brightness ---------------

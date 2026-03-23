@@ -46,6 +46,7 @@ import sys
 import threading
 import time
 
+import math
 import cv2
 import numpy as np
 
@@ -187,10 +188,16 @@ def _shutdown(reason: str = ""):
         print(f"\n[Main] Shutdown: {reason}")
     shared.stop_event.set()
 
+    # Give processing thread time to release serial lock
+    time.sleep(0.15)
+
     if _serial and _serial.connected:
-        _serial.set_signal(False)        # pin 12 LOW
-        _serial.send_velocity(0.0, 0.0)  # zero velocity
-        _serial.emergency_stop()         # stop + disable motors
+        try:
+            _serial.set_signal(False)        # pin 12 LOW
+            _serial.send_velocity(0.0, 0.0)  # zero velocity
+            _serial.emergency_stop()         # stop + disable motors
+        except Exception:
+            pass  # don't block shutdown
         time.sleep(0.1)
 
     if _camera and _camera.isOpened():
@@ -360,8 +367,12 @@ def _processing_thread(
     _hh_tilt_limit_hi = None
     _hh_last_time     = 0.0     # for velocity integration
 
-    while not shared.stop_event.is_set():
+    # Previous frame's commanded velocity (for camera motion compensation)
+    _prev_pan_vel  = 0.0
+    _prev_tilt_vel = 0.0
 
+    while not shared.stop_event.is_set():
+      try:
         # ── control events from UI / keyboard ──
         if shared.estop_event.is_set():
             shared.estop_event.clear()
@@ -438,7 +449,8 @@ def _processing_thread(
         if (_cal_check_ctr % 300 == 0              # every ~5 sec at 60fps
                 and shared.limits_calibrated
                 and shared.cal_pan_upper is not None
-                and serial.connected):
+                and serial.connected
+                and not shared.stop_event.is_set()):
             _q = serial.query_positions()
             if _q and not _q.get("pan_calibrated", True):
                 # Arduino lost calibration (likely reset) — re-send limits
@@ -448,8 +460,21 @@ def _processing_thread(
                     shared.cal_tilt_upper, shared.cal_tilt_lower)
                 print("[Processing] Limits restored.")
 
+        # ── Update turret position for waypoint dot projection ──
+        # Query serial every 10 frames (~6Hz) — fast enough for smooth dots,
+        # no integration drift issues
+        if shared.waypoint_mode and _cal_check_ctr % 10 == 0 and serial.connected and not shared.stop_event.is_set():
+            _tp = serial.query_positions()
+            if _tp is not None:
+                shared.turret_pan_deg = steps_to_degrees(
+                    _tp["pan_position"], config.PAN_GEAR_RATIO, config.PAN_MICROSTEP_MULTIPLIER)
+                shared.turret_tilt_deg = steps_to_degrees(
+                    _tp["tilt_position"], config.TILT_GEAR_RATIO, config.TILT_MICROSTEP_MULTIPLIER)
+
         # ── PID ──
         pan_error = tilt_error = pan_vel = tilt_vel = 0.0
+        _bl_lead_px_x = 0.0
+        _bl_lead_px_y = 0.0
 
         if target is not None and shared.tracking_enabled:
             # ── Latency-compensating prediction + ballistic velocity ──
@@ -457,20 +482,21 @@ def _processing_thread(
             _raw_vx = 0.0
             _raw_vy = 0.0
             _got_vel = False
+            dt_detect = 0.0
             if _had_target:
                 dt_detect = _now_t - _prev_detect_t
                 if dt_detect > 0.001:
                     _raw_vx = (target.aim_cx - _prev_aim_cx) / dt_detect
                     _raw_vy = (target.aim_cy - _prev_aim_cy) / dt_detect
                     _got_vel = True
+
+                    # Fast velocity for latency prediction (NO camera compensation
+                    # — prediction only needs relative pixel motion, small horizon)
                     _a = config.PREDICTION_VEL_ALPHA
                     _vel_px_x = _a * _raw_vx + (1 - _a) * _vel_px_x
                     _vel_px_y = _a * _raw_vy + (1 - _a) * _vel_px_y
                     _vel_stable_cnt += 1
-                    # Slow velocity for ballistic lead (separate EMA)
-                    _ba = config.BALLISTIC_VEL_ALPHA
-                    _bl_vel_px_x = _ba * _raw_vx + (1 - _ba) * _bl_vel_px_x
-                    _bl_vel_px_y = _ba * _raw_vy + (1 - _ba) * _bl_vel_px_y
+
                     _bl_stable_cnt += 1
             else:
                 _vel_px_x = 0.0
@@ -498,11 +524,27 @@ def _processing_thread(
             _bl_lead_px_x = 0.0
             _bl_lead_px_y = 0.0
             if (config.BALLISTIC_LEAD_ENABLED
-                    and shared.fire_mode != "off"
                     and _bl_stable_cnt >= config.BALLISTIC_MIN_STABILITY
                     and shared.est_distance_m > 0.5):
-                # Flight time from distance estimate
-                _flight_sec = shared.est_distance_m / max(1.0, config.DART_SPEED_MPS)
+                # Flight time with drag model (sphere in air)
+                # F_drag = 0.5 * Cd * rho * A * v²
+                # a_drag = F_drag / m = (0.5 * Cd * rho * A / m) * v²
+                # k = 0.5 * Cd * rho * A / m  (drag constant)
+                # With drag: v(t) = v0 / (1 + k*v0*t), x(t) = ln(1 + k*v0*t) / k
+                # Solve for t when x(t) = distance: t = (exp(k*d) - 1) / (k*v0)
+                _dist = shared.est_distance_m
+                _v0 = max(1.0, config.DART_SPEED_MPS)
+                if config.BALLISTIC_DRAG_MODEL and config.DART_MASS_KG > 0:
+                    _A = math.pi * (config.DART_DIAMETER_M / 2.0) ** 2
+                    _k = 0.5 * config.DART_CD * config.AIR_DENSITY * _A / config.DART_MASS_KG
+                    # t = (exp(k*d) - 1) / (k * v0)
+                    _kd = _k * _dist
+                    if _kd < 20:  # prevent overflow
+                        _flight_sec = (math.exp(_kd) - 1.0) / (_k * _v0)
+                    else:
+                        _flight_sec = _dist / _v0  # fallback
+                else:
+                    _flight_sec = _dist / _v0
                 # Lead offset in pixels
                 _bl_lead_px_x = _bl_vel_px_x * _flight_sec
                 _bl_lead_px_y = _bl_vel_px_y * _flight_sec
@@ -520,15 +562,13 @@ def _processing_thread(
                 _bl_lead_px_x = max(-_max_lead, min(_max_lead, _bl_lead_px_x))
                 _bl_lead_px_y = max(-_max_lead, min(_max_lead, _bl_lead_px_y))
 
-            # Blend lead in/out smoothly
+            # Blend lead in/out smoothly (use dt from velocity calc, not current time)
             _want_lead = (config.BALLISTIC_LEAD_ENABLED
-                          and shared.fire_mode != "off"
                           and _bl_stable_cnt >= config.BALLISTIC_MIN_STABILITY)
+            _blend_dt = dt_detect if (_got_vel and dt_detect > 0.001) else 0.016
             if _want_lead and _bl_blend_factor < 1.0:
-                _blend_dt = _now_t - _prev_detect_t if _prev_detect_t > 0 else 0.016
                 _bl_blend_factor = min(1.0, _bl_blend_factor + _blend_dt / max(0.01, config.BALLISTIC_BLEND_TIME))
             elif not _want_lead and _bl_blend_factor > 0.0:
-                _blend_dt = _now_t - _prev_detect_t if _prev_detect_t > 0 else 0.016
                 _bl_blend_factor = max(0.0, _bl_blend_factor - _blend_dt / max(0.01, config.BALLISTIC_BLEND_TIME))
 
             # Apply blended lead to aim point
@@ -554,9 +594,12 @@ def _processing_thread(
                     tilt_error  *= _dist_scale
 
             # Distance estimate: bbox height + heavy EMA + rate limiting
+            # Use proper pinhole model with focal length derived from FOV
             global _dist_ema, _dist_time
             if _bbox_h_px > 10:
-                _raw_dist = (config.DISTANCE_PERSON_HEIGHT_M * h) / _bbox_h_px
+                _focal_px = (w / 2.0) / math.tan(math.radians(
+                    config.CAMERA_PAN_DEG_PER_PX * w / 2.0))
+                _raw_dist = (config.DISTANCE_PERSON_HEIGHT_M * _focal_px) / _bbox_h_px
                 _now_d = time.perf_counter()
                 if _dist_ema <= 0:
                     _dist_ema = _raw_dist
@@ -727,7 +770,6 @@ def _processing_thread(
                     serial.enable_motors()
                     shared.motor_enabled = True
 
-                # Target angle in world frame
                 wp_pan_deg, wp_tilt_deg = shared.waypoints_world[shared.waypoint_current_idx]
 
                 # Current position from Arduino
@@ -740,35 +782,32 @@ def _processing_thread(
                     shared.turret_pan_deg  = _wp_cur_pan
                     shared.turret_tilt_deg = _wp_cur_tilt
 
-                    # Project waypoint to pixel position on current frame
-                    _d_pan  = wp_pan_deg  - _wp_cur_pan
-                    _d_tilt = wp_tilt_deg - _wp_cur_tilt
-                    # Invert to pixel space (same as annotator projection)
-                    if config.PAN_INVERT:
-                        _d_pan = -_d_pan
-                    if config.TILT_INVERT:
-                        _d_tilt = -_d_tilt
-                    _ppx = config.CAMERA_PAN_DEG_PER_PX
-                    _tpx = config.CAMERA_TILT_DEG_PER_PX
-                    _wp_px_x = w / 2.0 + (_d_pan  / _ppx if _ppx > 0 else 0)
-                    _wp_px_y = h / 2.0 + (_d_tilt / _tpx if _tpx > 0 else 0)
+                    # Error in degrees
+                    _wp_err_pan  = wp_pan_deg  - _wp_cur_pan
+                    _wp_err_tilt = wp_tilt_deg - _wp_cur_tilt
 
-                    # Standard normalized error (same frame as PID tracking)
-                    pan_error  = (_wp_px_x - w / 2.0) / (w / 2.0)
-                    tilt_error = (_wp_px_y - h / 2.0) / (h / 2.0)
+                    # Simple P-controller in degrees with speed limit
+                    _WP_KP = 8.0        # deg/sec per degree of error
+                    _WP_MAX_VEL = 200.0  # cap approach speed
+                    _WP_ARRIVE = 0.5     # degrees — close enough to fire
 
-                    pan_vel, tilt_vel = controller.compute(pan_error, tilt_error)
+                    pan_vel  = max(-_WP_MAX_VEL, min(_WP_MAX_VEL, _wp_err_pan  * _WP_KP))
+                    tilt_vel = max(-_WP_MAX_VEL, min(_WP_MAX_VEL, _wp_err_tilt * _WP_KP))
 
-                    # Check arrival: within 20px on screen
-                    _wp_px_dist = ((_wp_px_x - w / 2.0) ** 2 + (_wp_px_y - h / 2.0) ** 2) ** 0.5
-                    if _wp_px_dist < 20:
-                        # Fire single pulse
+                    # Natural deceleration: P-controller already slows down as
+                    # error shrinks (8 deg/sec at 1° error, 0.8 at 0.1°)
+
+                    _wp_err_total = (_wp_err_pan**2 + _wp_err_tilt**2) ** 0.5
+                    if _wp_err_total < _WP_ARRIVE:
+                        # Arrived — stop, fire, advance
                         serial.send_velocity(0.0, 0.0)
+                        time.sleep(0.05)  # brief settle
                         serial.set_signal(True)
                         time.sleep(config.FIRE_PULSE_DURATION)
                         serial.set_signal(False)
-                        print(f"[Waypoint] Hit #{shared.waypoint_current_idx + 1}/{len(shared.waypoints_world)}")
+                        print(f"[Waypoint] Hit #{shared.waypoint_current_idx + 1}/{len(shared.waypoints_world)} (err={_wp_err_total:.2f}°)")
                         shared.waypoint_current_idx += 1
+                        pan_vel = tilt_vel = 0.0
 
             # Sequence complete?
             if shared.waypoint_current_idx >= len(shared.waypoints_world) and shared.waypoint_executing:
@@ -906,7 +945,30 @@ def _processing_thread(
                 **params,
             }
 
+        # Store velocity for next frame's ballistic lead.
+        # The PD output IS the target's angular velocity — if the turret
+        # commands 30 deg/sec to keep up, the target moves at 30 deg/sec.
+        # Convert to pixels/sec for the lead offset calculation.
+        _prev_pan_vel  = pan_vel
+        _prev_tilt_vel = tilt_vel
+        _ppx = config.CAMERA_PAN_DEG_PER_PX
+        _tpx = config.CAMERA_TILT_DEG_PER_PX
+        _pd_vx = pan_vel / _ppx if _ppx > 0 else 0.0
+        _pd_vy = tilt_vel / _tpx if _tpx > 0 else 0.0
+        _ba = config.BALLISTIC_VEL_ALPHA
+        _bl_vel_px_x = _ba * _pd_vx + (1 - _ba) * _bl_vel_px_x
+        _bl_vel_px_y = _ba * _pd_vy + (1 - _ba) * _bl_vel_px_y
+        if config.BALLISTIC_LEAD_ENABLED and _bl_stable_cnt > 0 and _bl_stable_cnt % 30 == 0:
+            print(f"[BL-DBG] pv={pan_vel:.1f}d/s  pd_vx={_pd_vx:.0f}px/s  bl_vel={_bl_vel_px_x:.0f}  lead_px={_bl_lead_px_x * _bl_blend_factor:.0f}  dist={shared.est_distance_m:.1f}m  blend={_bl_blend_factor:.2f}")
+
         fps_loop.tick()
+
+      except Exception as _proc_err:
+        import traceback
+        print(f"[Processing] ERROR: {_proc_err}")
+        traceback.print_exc()
+        # Continue running — don't kill the thread over one bad frame
+        continue
 
     print("[Processing] Thread stopped.")
 
@@ -1073,7 +1135,7 @@ def _wp_button_hit(x: int, y: int) -> str | None:
 # ---------------------------------------------------------------------------
 
 _BL_WIN_W = 340
-_BL_WIN_H = 320
+_BL_WIN_H = 420
 _BL_BTN_H = 40
 _BL_BTN_W = 300
 _BL_BTN_PAD = 10
@@ -1318,6 +1380,7 @@ def _display_loop(controller: MotionController):
     _sp_last_time = 0.0
 
     while not shared.stop_event.is_set():
+      try:
         with shared.annotated_lock:
             frame = shared.annotated_frame
 
@@ -1383,12 +1446,8 @@ def _display_loop(controller: MotionController):
             _jog_last_time = _now_jog
             _jog_active = True
             shared.manual_jog = _jog_target
-            # Send immediately — don't wait for processing loop
-            if _serial and _serial.connected:
-                if not shared.motor_enabled:
-                    _serial.enable_motors()
-                    shared.motor_enabled = True
-                _serial.send_velocity(_jog_target[0], _jog_target[1])
+            # Let the processing thread handle serial — avoids deadlock
+            # when processing thread holds the serial lock for query_positions
 
         if not _wasd:
             if _key_down and (key == ord('f') or key == ord('F')):
@@ -1635,6 +1694,12 @@ def _display_loop(controller: MotionController):
         except cv2.error:
             break
 
+      except Exception as _disp_err:
+        import traceback
+        print(f"[Display] ERROR: {_disp_err}")
+        traceback.print_exc()
+        continue
+
     cv2.destroyAllWindows()
 
 
@@ -1750,8 +1815,10 @@ def _find_cameras() -> tuple[int, int | None]:
     target_fps = config.CAMERA_FPS
     results = []   # list of (idx, measured_fps)
 
-    print(f"[Camera] Probing indices 0-7 at {target_w}x{target_h} MJPG ...")
-    for idx in range(8):
+    # Only probe indices that PnP found (saves ~3s vs probing 0-7)
+    _probe_range = list(range(len(devices))) if devices else list(range(8))
+    print(f"[Camera] Probing indices {_probe_range} at {target_w}x{target_h} MJPG ...")
+    for idx in _probe_range:
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         if not cap.isOpened():
             continue
@@ -1759,19 +1826,18 @@ def _find_cameras() -> tuple[int, int | None]:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
         cap.set(cv2.CAP_PROP_FPS,          target_fps)
         cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        # Warm up
-        for _ in range(3):
-            cap.read()
-        # Time 10 frames
+        # Warm up (1 frame)
+        cap.read()
+        # Time 5 frames
         t0 = _time.perf_counter()
         good = 0
-        for _ in range(10):
+        for _ in range(5):
             ret, _ = cap.read()
             if ret:
                 good += 1
         elapsed = _time.perf_counter() - t0
         cap.release()
-        if good >= 5:
+        if good >= 3:
             measured = good / elapsed if elapsed > 0 else 0
             results.append((idx, measured))
             print(f"  [{idx}] measured {measured:.1f} fps ({good} frames in {elapsed:.2f}s)")
@@ -1901,4 +1967,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"\n[FATAL] {e}")
+        traceback.print_exc()
+        input("Press Enter to exit...")

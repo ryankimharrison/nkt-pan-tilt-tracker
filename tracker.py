@@ -20,6 +20,8 @@ _BYTETRACK_CFG   = _LOCAL_BYTETRACK if os.path.isfile(_LOCAL_BYTETRACK) else "by
 # COCO pose keypoint indices (0-based)
 LEFT_SHOULDER  = 5
 RIGHT_SHOULDER = 6
+LEFT_HIP       = 11
+RIGHT_HIP      = 12
 KEYPOINT_CONF_THRESH = 0.3
 
 
@@ -178,21 +180,51 @@ class Tracker:
         return kp_list
 
     def _shoulder_midpoint(self, keypoints, idx: int) -> tuple[float | None, float | None]:
-        """Return (cx, cy) between shoulders if both visible, else (None, None)."""
+        """Return (cx, cy) at torso center (between shoulders and hips).
+        Falls back to shoulder midpoint if hips not visible."""
         if keypoints is None or keypoints.xy is None or idx >= len(keypoints.xy):
             return (None, None)
         xy = keypoints.xy[idx]  # (17, 2)
         conf = keypoints.conf[idx] if keypoints.conf is not None else None
         ls = xy[LEFT_SHOULDER]
         rs = xy[RIGHT_SHOULDER]
-        if conf is not None:
-            if conf[LEFT_SHOULDER] < KEYPOINT_CONF_THRESH and conf[RIGHT_SHOULDER] < KEYPOINT_CONF_THRESH:
-                return (None, None)
-            if conf[LEFT_SHOULDER] >= KEYPOINT_CONF_THRESH and conf[RIGHT_SHOULDER] >= KEYPOINT_CONF_THRESH:
-                return ((float(ls[0]) + float(rs[0])) / 2.0, (float(ls[1]) + float(rs[1])) / 2.0)
-            if conf[LEFT_SHOULDER] >= KEYPOINT_CONF_THRESH:
-                return (float(ls[0]), float(ls[1]))
-            return (float(rs[0]), float(rs[1]))
+        lh = xy[LEFT_HIP]
+        rh = xy[RIGHT_HIP]
+        if conf is None:
+            return (None, None)
+
+        # Check which keypoints are visible
+        ls_ok = conf[LEFT_SHOULDER] >= KEYPOINT_CONF_THRESH
+        rs_ok = conf[RIGHT_SHOULDER] >= KEYPOINT_CONF_THRESH
+        lh_ok = conf[LEFT_HIP] >= KEYPOINT_CONF_THRESH
+        rh_ok = conf[RIGHT_HIP] >= KEYPOINT_CONF_THRESH
+
+        if not ls_ok and not rs_ok:
+            return (None, None)
+
+        # Shoulder center
+        if ls_ok and rs_ok:
+            sx = (float(ls[0]) + float(rs[0])) / 2.0
+            sy = (float(ls[1]) + float(rs[1])) / 2.0
+        elif ls_ok:
+            sx, sy = float(ls[0]), float(ls[1])
+        else:
+            sx, sy = float(rs[0]), float(rs[1])
+
+        # Hip center (if visible)
+        if lh_ok and rh_ok:
+            hx = (float(lh[0]) + float(rh[0])) / 2.0
+            hy = (float(lh[1]) + float(rh[1])) / 2.0
+        elif lh_ok:
+            hx, hy = float(lh[0]), float(lh[1])
+        elif rh_ok:
+            hx, hy = float(rh[0]), float(rh[1])
+        else:
+            # No hips visible — use shoulder midpoint only
+            return (sx, sy)
+
+        # Torso center = midpoint between shoulder center and hip center
+        return ((sx + hx) / 2.0, (sy + hy) / 2.0)
         # No conf — assume visible if non-zero
         return ((float(ls[0]) + float(rs[0])) / 2.0, (float(ls[1]) + float(rs[1])) / 2.0)
 
