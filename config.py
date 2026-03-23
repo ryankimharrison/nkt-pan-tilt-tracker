@@ -68,7 +68,7 @@ MAX_TILT_VELOCITY = 300.0
 # A tiny non-zero value avoids floating-point noise at perfect centre.
 DEADZONE = 0.001
 DEADZONE_CENTER_PULL = 0.0
-DYNAMIC_DEADZONE = False          # disabled — point-target uses no deadzone
+DYNAMIC_DEADZONE = True           # scales deadzone with target proximity
 
 # Threshold (normalized) used for "centered" detection and motor hysteresis.
 # Replaces the old deadzone-based check. ~0.01 = 1% of frame half-width (~6px on 1280).
@@ -142,6 +142,15 @@ FIRE_AUTO_INTERVAL = 0.2
 # Set DISTANCE_GAIN_REF_HEIGHT = 0.0 to disable.
 DISTANCE_GAIN_REF_HEIGHT = 0.35
 DISTANCE_GAIN_MAX        = 8.0
+
+# --------------- Distance estimation ---------------
+# Bbox-height based with heavy temporal smoothing + rate limiting.
+# Immune to pose changes (turning, squatting) via slow EMA + max slew rate.
+DISTANCE_PERSON_HEIGHT_M  = 1.7    # assumed average person height
+DISTANCE_EMA_ALPHA        = 0.15   # heavy smoothing — rejects pose-induced spikes
+DISTANCE_MAX_RATE_MPS     = 1.5    # max distance change (m/s) — nobody walks faster
+DISTANCE_CLOSE_M          = 3.0    # < 3m = CLOSE
+DISTANCE_FAR_M            = 8.0    # > 8m = FAR, between = MEDIUM
 
 # --------------- Predictive lead ---------------
 # When a target is moving, add a lead offset to the aim point so the

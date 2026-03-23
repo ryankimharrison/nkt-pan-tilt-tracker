@@ -96,6 +96,14 @@ class SharedState:
         self.tilt_lower_calibrated = False  # True after user presses X
         self.limits_calibrated     = False  # True after user presses L (all limits set)
 
+        self.est_distance_m = 0.0  # estimated distance to target (meters)
+
+        # Stored calibration offsets so we can re-send after Arduino reset
+        self.cal_pan_upper:  int | None = None
+        self.cal_pan_lower:  int | None = None
+        self.cal_tilt_upper: int | None = None
+        self.cal_tilt_lower: int | None = None
+
 
 shared = SharedState()
 
@@ -275,6 +283,10 @@ def _dynamic_deadzone(target, frame_h: int) -> float:
     return dz_px / (frame_h / 2.0)
 
 
+# Distance estimation state (bbox height + heavy EMA + rate limiting)
+_dist_ema  = 0.0
+_dist_time = 0.0
+
 # ---------------------------------------------------------------------------
 # Thread 2 — Processing loop (detection → tracking → PID → serial)
 # ---------------------------------------------------------------------------
@@ -302,6 +314,7 @@ def _processing_thread(
     _vel_px_y       = 0.0
     _had_target     = False
     _vel_stable_cnt = 0                # frames of stable velocity
+    _cal_check_ctr  = 0                # calibration watchdog frame counter
 
     # Hand/head position control state
     _hh_pos_initialized = False
@@ -388,6 +401,21 @@ def _processing_thread(
                 print("[Processing] Idle timeout — motors de-energized.")
         _was_idle = is_idle or not shared.tracking_enabled
 
+        # ── Calibration watchdog: re-send limits if Arduino reset ──
+        _cal_check_ctr += 1
+        if (_cal_check_ctr % 300 == 0              # every ~5 sec at 60fps
+                and shared.limits_calibrated
+                and shared.cal_pan_upper is not None
+                and serial.connected):
+            _q = serial.query_positions()
+            if _q and not _q.get("pan_calibrated", True):
+                # Arduino lost calibration (likely reset) — re-send limits
+                print("[Processing] Arduino lost calibration — re-sending limits ...")
+                serial.calibrate_from_center(
+                    shared.cal_pan_upper, shared.cal_pan_lower,
+                    shared.cal_tilt_upper, shared.cal_tilt_lower)
+                print("[Processing] Limits restored.")
+
         # ── PID ──
         pan_error = tilt_error = pan_vel = tilt_vel = 0.0
 
@@ -427,8 +455,9 @@ def _processing_thread(
 
             # Distance-adaptive gain: boost error when target is far (small box)
             # Soft rolloff above 4x to prevent gain discontinuity at distance
+            _bbox_h_px = target.y2 - target.y1
             if config.DISTANCE_GAIN_REF_HEIGHT > 0.0:
-                _bbox_h_frac = (target.y2 - target.y1) / h
+                _bbox_h_frac = _bbox_h_px / h
                 if _bbox_h_frac > 0.01:
                     _raw_scale = config.DISTANCE_GAIN_REF_HEIGHT / _bbox_h_frac
                     if _raw_scale <= 4.0:
@@ -438,6 +467,35 @@ def _processing_thread(
                     _dist_scale = min(_dist_scale, config.DISTANCE_GAIN_MAX)
                     pan_error   *= _dist_scale
                     tilt_error  *= _dist_scale
+
+            # Distance estimate: bbox height + heavy EMA + rate limiting
+            global _dist_ema, _dist_time
+            if _bbox_h_px > 10:
+                _raw_dist = (config.DISTANCE_PERSON_HEIGHT_M * h) / _bbox_h_px
+                _now_d = time.perf_counter()
+                if _dist_ema <= 0:
+                    _dist_ema = _raw_dist
+                    _dist_time = _now_d
+                else:
+                    # Rate limit: clamp raw to max slew rate before EMA
+                    _dt_d = _now_d - _dist_time
+                    if _dt_d > 0:
+                        _max_delta = config.DISTANCE_MAX_RATE_MPS * _dt_d
+                        _clamped = max(_dist_ema - _max_delta,
+                                       min(_dist_ema + _max_delta, _raw_dist))
+                    else:
+                        _clamped = _raw_dist
+                    # Heavy EMA on top of rate-limited value
+                    _a = config.DISTANCE_EMA_ALPHA
+                    _dist_ema = _a * _clamped + (1 - _a) * _dist_ema
+                    _dist_time = _now_d
+                shared.est_distance_m = _dist_ema
+
+            # Dynamic deadzone: scales with target proximity
+            if config.DYNAMIC_DEADZONE:
+                _dz = _dynamic_deadzone(target, h)
+                controller.pan.deadzone = _dz
+                controller.tilt.deadzone = _dz
 
             pan_vel, tilt_vel = controller.compute(pan_error, tilt_error)
 
@@ -650,6 +708,7 @@ def _processing_thread(
                 "tilt_lower_calibrated": shared.tilt_lower_calibrated,
                 "limits_calibrated": shared.limits_calibrated,
                 "control_source": shared.control_source,
+                "est_distance_m": getattr(shared, 'est_distance_m', 0.0),
             },
         }
 
@@ -684,6 +743,7 @@ def _processing_thread(
                 "in_fire_zone":           _in_fire_zone,
                 "tilt_upper_calibrated":  shared.tilt_upper_calibrated,
                 "tilt_lower_calibrated":  shared.tilt_lower_calibrated,
+                "est_distance_m":         round(getattr(shared, 'est_distance_m', 0.0), 2),
                 **params,
             }
 
@@ -986,6 +1046,11 @@ def _display_loop(controller: MotionController):
                     shared.tilt_upper_calibrated = True
                     shared.tilt_lower_calibrated = True
                     shared.limits_calibrated = True
+                    # Store offsets so processing thread can re-send after Arduino reset
+                    shared.cal_pan_upper  = 2662
+                    shared.cal_pan_lower  = -2662
+                    shared.cal_tilt_upper = 978
+                    shared.cal_tilt_lower = -2898
                     print("[Display] All limits set from center — Pan: ±2662 (±110°), Tilt: +978/-2898")
                 else:
                     print("[Display] Calibration from center failed (no reply).")
