@@ -23,6 +23,9 @@ RIGHT_SHOULDER = 6
 LEFT_HIP       = 11
 RIGHT_HIP      = 12
 KEYPOINT_CONF_THRESH = 0.3
+# Minimum average keypoint confidence to use keypoint-based aim point
+# Below this, fall back to bbox center (more stable when joints are noisy)
+KEYPOINT_AIM_MIN_CONF = 0.5
 
 
 @dataclass
@@ -101,17 +104,20 @@ class Tracker:
         """
         h, w = frame_shape
 
+        # Use lower conf for YOLO to let ByteTrack see marginal detections.
+        # Filter in _parse_results: tracked targets keep at lower threshold (hysteresis).
+        _keep_conf = config.CONFIDENCE_THRESHOLD * 0.6  # ~0.24 — keep threshold
         results = self._model.track(
             frame,
             classes=[0],                         # person only
-            conf=config.CONFIDENCE_THRESHOLD,
+            conf=_keep_conf,                     # low threshold — ByteTrack handles persistence
             persist=True,                        # maintains IDs across frames
             tracker=_BYTETRACK_CFG,
             imgsz=config.CAMERA_WIDTH,           # run inference at full camera resolution
             verbose=False,
         )
 
-        tracks = self._parse_results(results)
+        tracks = self._parse_results(results, tracked_id=self._target_id)
 
         if not tracks:
             self._no_det_counter += 1
@@ -143,8 +149,10 @@ class Tracker:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _parse_results(self, results) -> list[Track]:
+    def _parse_results(self, results, tracked_id: int | None = None) -> list[Track]:
         tracks: list[Track] = []
+        _acquire_conf = config.CONFIDENCE_THRESHOLD        # higher to acquire new target
+        _keep_conf    = config.CONFIDENCE_THRESHOLD * 0.6  # lower to keep existing target
         for r in results:
             if r.boxes is None:
                 continue
@@ -156,12 +164,26 @@ class Tracker:
                 tid  = int(boxes.id[i])
                 x1, y1, x2, y2 = boxes.xyxy[i].tolist()
                 conf = float(boxes.conf[i])
-                aim_cx, aim_cy = self._shoulder_midpoint(kpts, i) if kpts is not None else (None, None)
-                if aim_cx is not None and aim_cy is not None:
-                    pass  # use shoulder midpoint
-                else:
-                    aim_cx = (x1 + x2) / 2.0
-                    aim_cy = (y1 + y2) / 2.0
+                # Hysteresis: already-tracked target uses lower threshold
+                _min_conf = _keep_conf if (tracked_id is not None and tid == tracked_id) else _acquire_conf
+                if conf < _min_conf:
+                    continue
+                # Default: bbox center (always stable)
+                aim_cx = (x1 + x2) / 2.0
+                aim_cy = (y1 + y2) / 2.0
+
+                # Only use keypoint-based aim if enough keypoints are confident
+                if kpts is not None and kpts.conf is not None and i < len(kpts.conf):
+                    _kp_confs = kpts.conf[i]
+                    # Average confidence of torso keypoints (shoulders + hips)
+                    _torso_idxs = [LEFT_SHOULDER, RIGHT_SHOULDER, LEFT_HIP, RIGHT_HIP]
+                    _torso_confs = [float(_kp_confs[j]) for j in _torso_idxs]
+                    _avg_torso_conf = sum(_torso_confs) / len(_torso_confs)
+
+                    if _avg_torso_conf >= KEYPOINT_AIM_MIN_CONF:
+                        _kp_aim = self._shoulder_midpoint(kpts, i)
+                        if _kp_aim[0] is not None:
+                            aim_cx, aim_cy = _kp_aim
                 kp_list = self._extract_keypoints(kpts, i) if kpts is not None else None
                 tracks.append(Track(tid, x1, y1, x2, y2, conf, aim_cx=aim_cx, aim_cy=aim_cy, keypoints=kp_list))
         return tracks

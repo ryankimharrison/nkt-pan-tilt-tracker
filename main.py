@@ -1,5 +1,6 @@
-# Last edited: 2026-03-23 ~3:30 AM
-# Added ballistic lead compensation (P key) — predicts dart flight time from distance estimate, shifts aim point ahead of moving targets. Separate slow velocity EMA, gravity drop compensation, blend ramp, and settings panel with adjustable dart speed.
+# Last edited: 2026-03-23 ~6:15 AM
+# Smart confidence-based camera switching (wide↔narrow), detection hysteresis, bbox-center fallback when keypoints are noisy.
+# ffmpeg-based DirectShow device enumeration for reliable VID-based camera identification.
 
 """
 main.py — Entry point for the pan-tilt tracker.
@@ -26,6 +27,8 @@ Keyboard shortcuts (OpenCV window)
   E       — Emergency stop (motors stop + de-energize immediately)
   R       — Re-center (force target re-acquisition)
   Z       — Zero position counters (after manually repositioning rig)
+  [ / ]   — Nudge crosshair left / right (1px per press)
+  - / =   — Nudge crosshair up / down (1px per press)
   L       — Calibrate limits from center position
   I       — Query current position/limits info
   Q / Esc — Quit
@@ -116,6 +119,16 @@ class SharedState:
         self.turret_tilt_deg      = 0.0
 
         self._wp_close_requested = False
+
+        # Scan mode
+        self.scan_active = False
+        self.scan_paused = False  # True when paused because target detected
+
+        # Narrow/IR camera (Logitech C270)
+        self.narrow_cam_available = False
+        self.using_narrow_cam = False  # True when precision tracking with narrow cam
+        self.narrow_frame = None       # latest frame from narrow camera
+        self.narrow_frame_lock = threading.Lock()
 
         # Calibration state
         self.cal_active     = False
@@ -233,6 +246,19 @@ def _capture_thread(cap: cv2.VideoCapture, fps_counter: FPSCounter):
             shared.latest_frame = frame
             shared.latest_frame_time = time.perf_counter()
     print("[Capture] Thread stopped.")
+
+
+def _narrow_capture_thread(cap: cv2.VideoCapture):
+    """Continuously grabs frames from the narrow/IR camera into shared state."""
+    print("[NarrowCap] Thread started.")
+    while not shared.stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.01)
+            continue
+        with shared.narrow_frame_lock:
+            shared.narrow_frame = frame
+    print("[NarrowCap] Thread stopped.")
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +381,23 @@ def _processing_thread(
     _bl_blend_factor  = 0.0            # 0.0 = no lead, 1.0 = full lead (ramps in/out)
     _bl_blend_time_start = 0.0         # when blend started ramping
 
+    # Scan mode state
+    _scan_pan_deg    = 0.0     # current virtual pan position (degrees from start)
+    _scan_tilt_deg   = 0.0     # current virtual tilt position
+    _scan_pan_dir    = 1.0     # +1 = sweeping right, -1 = sweeping left
+    _scan_initialized = False
+    _scan_tilt_stepping = False  # True while tilt is stepping between rows
+    _scan_tilt_step_target = 0.0
+    _scan_tilt_step_start = 0.0
+
+    # Narrow camera probe: periodically try narrow when wide sees nothing
+    _narrow_probe_ctr = 0       # frames with no detection on wide
+    _narrow_probe_active = False # True while probing with narrow cam
+    _narrow_probe_frames = 0    # frames spent on narrow during probe
+    _narrow_confidence = 0.0    # 0-1, how confident we are narrow is better (ramps up/down)
+    _wide_confidence = 1.0      # 0-1, how confident we are wide is better
+    _frames_on_current_cam = 0  # frames since last switch
+
     # Hand/head position control state
     _hh_pos_initialized = False
     _hh_pan_pos_deg   = 0.0     # estimated pan position (raw degrees)
@@ -407,10 +450,21 @@ def _processing_thread(
         if pending:
             controller.update_params(**pending)
 
-        # ── grab latest frame (single source: display shows exactly what detector sees) ──
-        with shared.frame_lock:
-            frame = shared.latest_frame
-            _frame_time = shared.latest_frame_time
+        # ── grab latest frame ──
+        # If narrow camera is available and we have a locked target, use it
+        # for precision tracking. Otherwise use the wide camera.
+        _use_narrow = (shared.narrow_cam_available
+                       and shared.using_narrow_cam
+                       and shared.narrow_frame is not None)
+
+        if _use_narrow:
+            with shared.narrow_frame_lock:
+                frame = shared.narrow_frame.copy() if shared.narrow_frame is not None else None
+            _frame_time = time.perf_counter()
+        else:
+            with shared.frame_lock:
+                frame = shared.latest_frame
+                _frame_time = shared.latest_frame_time
         if frame is None:
             time.sleep(0.001)
             continue
@@ -420,12 +474,11 @@ def _processing_thread(
             _mean = cv2.mean(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))[0]
             if _mean > 1.0:
                 _scale = config.AUTO_BRIGHTNESS_TARGET / _mean
-                # Gamma-style scale: gentle in highlights, stronger in shadows
                 frame = cv2.convertScaleAbs(frame, alpha=_scale, beta=0)
 
         h, w = frame.shape[:2]
 
-        # ── detection + tracking (single model.track() call) ──
+        # ── detection + tracking ──
         track_result = tracker.update(frame, (h, w), cycle_target_event=shared.cycle_target_event)
         fps_inference.tick()
         tracks  = track_result.tracks
@@ -434,14 +487,87 @@ def _processing_thread(
         # When tracking is disabled OR limits not calibrated, suppress target so PID stays zero
         target = track_result.target if (shared.tracking_enabled and shared.limits_calibrated) else None
 
+        # ── Smart camera switching (wide ↔ narrow) ──
+        # Switch TO narrow when: target locked, near center (within 15% of frame),
+        #   and we've been tracking for at least 10 frames (stable lock).
+        # Switch BACK to wide when: target lost, target near frame edge (>40%),
+        #   or idle (need wide FOV for re-acquisition).
+        if shared.narrow_cam_available:
+            _frames_on_current_cam += 1
+            _no_target_on_narrow = 0  # consecutive frames with no target while on narrow
+
+            if target is not None:
+                _narrow_probe_ctr = 0
+                _narrow_probe_active = False
+                _narrow_probe_frames = 0
+
+            # ── Switch TO narrow: build confidence when conditions are right ──
+            if not shared.using_narrow_cam and target is not None:
+                _tcx_norm = abs(target.aim_cx - w / 2.0) / (w / 2.0)
+                _tcy_norm = abs(target.aim_cy - h / 2.0) / (h / 2.0)
+                _bbox_frac = (target.y2 - target.y1) / h
+
+                if _tcx_norm < 0.20 and _tcy_norm < 0.20 and _bbox_frac < 0.45:
+                    _narrow_confidence = min(1.0, _narrow_confidence + 0.02)
+                else:
+                    _narrow_confidence = max(0.0, _narrow_confidence - 0.01)
+
+                if _narrow_confidence > 0.7 and _frames_on_current_cam > 30:
+                    shared.using_narrow_cam = True
+                    _frames_on_current_cam = 0
+                    _narrow_confidence = 1.0
+                    print(f"[Camera] → NARROW (locked on target)")
+
+            # ── Stay on narrow as long as target is detected ──
+            # Only switch back to wide when target is ACTUALLY LOST (not just near edge)
+            elif shared.using_narrow_cam and not _narrow_probe_active:
+                if target is not None:
+                    # Target visible on narrow — STAY. Reset any wide pressure.
+                    _wide_confidence = 0.0
+                    _narrow_confidence = 1.0
+                else:
+                    # No target on narrow — ramp up wide confidence
+                    _wide_confidence = min(1.0, _wide_confidence + 0.02)
+                    # Only switch back after sustained loss (~1.5 sec)
+                    if _wide_confidence > 0.6 and _frames_on_current_cam > 15:
+                        shared.using_narrow_cam = False
+                        _frames_on_current_cam = 0
+                        _narrow_confidence = 0.0
+                        print("[Camera] → WIDE (target lost on narrow, re-acquiring)")
+
+            # Narrow probe: if wide sees nothing for a while, try narrow
+            if target is None and not shared.using_narrow_cam and not _narrow_probe_active:
+                _narrow_probe_ctr += 1
+                if _narrow_probe_ctr >= 90:  # ~1.5 sec no detection
+                    _narrow_probe_active = True
+                    _narrow_probe_frames = 0
+                    shared.using_narrow_cam = True
+                    _frames_on_current_cam = 0
+                    print("[Camera] Probing NARROW (no detection on wide)")
+
+            if _narrow_probe_active:
+                _narrow_probe_frames += 1
+                if target is not None:
+                    _narrow_probe_active = False
+                    _narrow_probe_ctr = 0
+                    _narrow_confidence = 0.8  # boost confidence since we found something
+                    print("[Camera] Probe SUCCESS — staying on NARROW")
+                elif _narrow_probe_frames >= 45:
+                    _narrow_probe_active = False
+                    _narrow_probe_ctr = 0
+                    shared.using_narrow_cam = False
+                    print("[Camera] Probe done — back to WIDE (nothing found)")
+
         # ── idle de-energize (fire only on the transition into idle) ──
+        _scanning = shared.scan_active and not shared.scan_paused
         if (is_idle or not shared.tracking_enabled) and not _was_idle:
-            if shared.motor_enabled:
-                serial.disable_motors()
-                shared.motor_enabled = False
-            controller.reset()
-            if is_idle:
-                print("[Processing] Idle timeout — motors de-energized.")
+            if not _scanning:  # don't de-energize while scanning
+                if shared.motor_enabled:
+                    serial.disable_motors()
+                    shared.motor_enabled = False
+                controller.reset()
+                if is_idle:
+                    print("[Processing] Idle timeout — motors de-energized.")
         _was_idle = is_idle or not shared.tracking_enabled
 
         # ── Calibration watchdog: re-send limits if Arduino reset ──
@@ -575,8 +701,10 @@ def _processing_thread(
             aim_cx += _bl_lead_px_x * _bl_blend_factor
             aim_cy += _bl_lead_px_y * _bl_blend_factor
 
-            pan_error  = (aim_cx - w / 2.0) / (w / 2.0)
-            tilt_error = (aim_cy - h / 2.0) / (h / 2.0)
+            _cx_off = w / 2.0 + config.CROSSHAIR_OFFSET_X
+            _cy_off = h / 2.0 + config.CROSSHAIR_OFFSET_Y
+            pan_error  = (aim_cx - _cx_off) / (w / 2.0)
+            tilt_error = (aim_cy - _cy_off) / (h / 2.0)
 
             # Distance-adaptive gain: boost error when target is far (small box)
             # Soft rolloff above 4x to prevent gain discontinuity at distance
@@ -822,6 +950,67 @@ def _processing_thread(
             # Not in hand/head/waypoint mode — reset so we re-query on next entry
             _hh_pos_initialized = False
 
+        # ── Scan mode: serpentine sweep when no target ──
+        if shared.scan_active:
+            if target is not None and config.SCAN_PAUSE_ON_TARGET:
+                # Target found — pause scan, let PID take over
+                if not shared.scan_paused:
+                    shared.scan_paused = True
+                    print("[Scan] Paused — target detected")
+            elif target is None and shared.scan_paused and config.SCAN_RESUME_ON_LOST:
+                shared.scan_paused = False
+                _scan_initialized = False  # re-query position on resume
+                print("[Scan] Resumed — target lost")
+
+            if not shared.scan_paused and target is None:
+                # Enable motors if needed
+                if not shared.motor_enabled:
+                    serial.enable_motors()
+                    shared.motor_enabled = True
+
+                # One-time init
+                if not _scan_initialized:
+                    _scan_initialized = True
+                    _scan_pan_deg = 0.0
+                    _scan_tilt_deg = -config.SCAN_TILT_RANGE  # start at top
+                    _scan_pan_dir = 1.0
+
+                # Advance scan position by time step
+                dt_scan = 1.0 / max(1.0, fps_loop.get())
+                _scan_pan_deg += _scan_pan_dir * config.SCAN_PAN_SPEED * dt_scan
+
+                # Check pan bounds — reverse and start tilt step
+                if _scan_pan_deg > config.SCAN_PAN_RANGE:
+                    _scan_pan_deg = config.SCAN_PAN_RANGE
+                    _scan_pan_dir = -1.0
+                    _scan_tilt_deg += config.SCAN_TILT_STEP
+                    _scan_tilt_stepping = True
+                    _scan_tilt_step_start = 0.0
+                elif _scan_pan_deg < -config.SCAN_PAN_RANGE:
+                    _scan_pan_deg = -config.SCAN_PAN_RANGE
+                    _scan_pan_dir = 1.0
+                    _scan_tilt_deg += config.SCAN_TILT_STEP
+                    _scan_tilt_stepping = True
+                    _scan_tilt_step_start = 0.0
+
+                # Check tilt bounds — wrap back to top
+                if _scan_tilt_deg > config.SCAN_TILT_RANGE:
+                    _scan_tilt_deg = -config.SCAN_TILT_RANGE
+
+                # Direct velocity output — no serial queries needed
+                if _scan_tilt_stepping:
+                    # Tilt step in progress: drive tilt, pause pan
+                    pan_vel = 0.0
+                    tilt_vel = config.SCAN_PAN_SPEED * 0.8  # step down at 80% of pan speed
+                    _scan_tilt_step_start += tilt_vel * dt_scan
+                    if _scan_tilt_step_start >= config.SCAN_TILT_STEP:
+                        _scan_tilt_stepping = False
+                        _scan_tilt_step_start = 0.0
+                else:
+                    # Normal pan sweep
+                    pan_vel = _scan_pan_dir * config.SCAN_PAN_SPEED
+                    tilt_vel = 0.0
+
         # ── send velocity ──
         if shared.motor_enabled:
             serial.send_velocity(pan_vel, tilt_vel)
@@ -829,8 +1018,8 @@ def _processing_thread(
         # ── fire zone: crosshair inside tracked person's bounding box ──
         _in_fire_zone = False
         if target is not None:
-            cx_frame = w / 2.0
-            cy_frame = h / 2.0
+            cx_frame = w / 2.0 + config.CROSSHAIR_OFFSET_X
+            cy_frame = h / 2.0 + config.CROSSHAIR_OFFSET_Y
             _in_fire_zone = (target.x1 <= cx_frame <= target.x2
                              and target.y1 <= cy_frame <= target.y2)
 
@@ -907,6 +1096,10 @@ def _processing_thread(
                                       _bl_lead_px_y * _bl_blend_factor)
                                      if config.BALLISTIC_LEAD_ENABLED else (0.0, 0.0),
                 "ballistic_active": config.BALLISTIC_LEAD_ENABLED and _bl_blend_factor > 0.01,
+                "vel_px": (_vel_px_x, _vel_px_y),
+                "predict_px": (aim_cx - target.aim_cx if target else 0.0,
+                               aim_cy - target.aim_cy if target else 0.0),
+                "using_narrow_cam": shared.using_narrow_cam,
             },
         }
 
@@ -1449,6 +1642,21 @@ def _display_loop(controller: MotionController):
             # Let the processing thread handle serial — avoids deadlock
             # when processing thread holds the serial lock for query_positions
 
+        # ── Arrow-style crosshair offset: [ ] for X, - = for Y ──
+        _CROSSHAIR_STEP = 1  # pixels per keypress
+        if key == ord('['):
+            config.CROSSHAIR_OFFSET_X -= _CROSSHAIR_STEP
+            print(f"[Display] Crosshair offset: ({config.CROSSHAIR_OFFSET_X}, {config.CROSSHAIR_OFFSET_Y})")
+        elif key == ord(']'):
+            config.CROSSHAIR_OFFSET_X += _CROSSHAIR_STEP
+            print(f"[Display] Crosshair offset: ({config.CROSSHAIR_OFFSET_X}, {config.CROSSHAIR_OFFSET_Y})")
+        elif key == ord('-'):
+            config.CROSSHAIR_OFFSET_Y -= _CROSSHAIR_STEP
+            print(f"[Display] Crosshair offset: ({config.CROSSHAIR_OFFSET_X}, {config.CROSSHAIR_OFFSET_Y})")
+        elif key == ord('='):
+            config.CROSSHAIR_OFFSET_Y += _CROSSHAIR_STEP
+            print(f"[Display] Crosshair offset: ({config.CROSSHAIR_OFFSET_X}, {config.CROSSHAIR_OFFSET_Y})")
+
         if not _wasd:
             if _key_down and (key == ord('f') or key == ord('F')):
                 _cycle = {"off": "auto", "auto": "manual", "manual": "off"}
@@ -1682,6 +1890,15 @@ def _display_loop(controller: MotionController):
                     print("[Display] Calibration from center failed (no reply).")
             else:
                 print("[Display] L key: no serial connection.")
+        elif _key_down and (key == ord('g') or key == ord('G')):
+            shared.scan_active = not shared.scan_active
+            if shared.scan_active:
+                shared.scan_paused = False
+                print("[Display] Scan mode ON — serpentine sweep ±%.0f° pan, ±%.0f° tilt"
+                      % (config.SCAN_PAN_RANGE, config.SCAN_TILT_RANGE))
+            else:
+                shared.scan_paused = False
+                print("[Display] Scan mode OFF")
 
         _prev_key = key
 
@@ -1787,77 +2004,108 @@ def _is_internal(device: dict) -> bool:
     return False
 
 
-def _find_cameras() -> tuple[int, int | None]:
+def _find_cameras() -> tuple[int, int | None, int | None]:
     """
-    Identify which DirectShow index is the external USB cam (SVPRO) and which
-    is the internal laptop webcam.
+    Identify cameras by VID using ffmpeg's DirectShow enumeration.
+    ffmpeg -list_devices gives us device names AND VIDs in the exact
+    DirectShow index order that OpenCV uses.
 
-    Returns (external_idx, internal_idx).  internal_idx may be None if the
-    built-in webcam is disabled or not found.
-
-    Strategy: open each camera at 1280x720 MJPG, read 10 frames, and measure
-    actual FPS.  The SVPRO delivers ~60 fps; the built-in webcam tops out at
-    ~30 fps regardless of what it reports via CAP_PROP_FPS.
+    Returns (external_idx, internal_idx, narrow_idx).
     """
-    import time as _time
+    import subprocess, shutil
 
-    # Log PnP info for debugging only
-    devices = _query_pnp_cameras()
-    if devices:
-        print("[Camera] PnP camera list (info only):")
-        for i, d in enumerate(devices):
-            tag = "INTERNAL" if _is_internal(d) else "EXTERNAL"
-            print(f"  [{i}] {tag}: {d['name']}  ({d['instance_id']})")
+    _SVPRO_VID     = "VID_32E4"
+    _LOGITECH_VID  = "VID_046D"
 
-    # --- Measure actual FPS for each working index ---
-    target_w   = config.CAMERA_WIDTH
-    target_h   = config.CAMERA_HEIGHT
-    target_fps = config.CAMERA_FPS
-    results = []   # list of (idx, measured_fps)
+    # Find ffmpeg binary
+    _ffmpeg = shutil.which("ffmpeg")
+    if not _ffmpeg:
+        # Check winget install location
+        import glob
+        _candidates = glob.glob(
+            "C:/Users/*/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg*/ffmpeg-*/bin/ffmpeg.exe")
+        if _candidates:
+            _ffmpeg = _candidates[0]
 
-    # Only probe indices that PnP found (saves ~3s vs probing 0-7)
-    _probe_range = list(range(len(devices))) if devices else list(range(8))
-    print(f"[Camera] Probing indices {_probe_range} at {target_w}x{target_h} MJPG ...")
-    for idx in _probe_range:
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  target_w)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, target_h)
-        cap.set(cv2.CAP_PROP_FPS,          target_fps)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        # Warm up (1 frame)
-        cap.read()
-        # Time 5 frames
-        t0 = _time.perf_counter()
-        good = 0
-        for _ in range(5):
+    external_idx = None
+    internal_idx = None
+    narrow_idx   = None
+
+    if _ffmpeg:
+        try:
+            r = subprocess.run(
+                [_ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+                capture_output=True, text=True, timeout=5,
+            )
+            # ffmpeg outputs to stderr. Parse both device name and alternative name lines.
+            # Device line: [in#0 @ ...] "HD USB Camera" (video)
+            # Alt line:    [in#0 @ ...]   Alternative name "@device_pnp_\\?\usb#vid_32e4&pid_9230..."
+            _output = r.stdout + r.stderr
+            _dshow_idx = 0
+            _last_name = ""
+            print("[Camera] DirectShow devices (ffmpeg):")
+            for line in _output.splitlines():
+                if '(video)' in line and '"' in line:
+                    start = line.index('"') + 1
+                    end = line.index('"', start)
+                    _last_name = line[start:end]
+                elif 'Alternative name' in line and 'device_pnp' in line and _last_name:
+                    # Extract VID from the PnP path
+                    _line_upper = line.upper()
+                    _vid = ""
+                    _vid_pos = _line_upper.find("VID_")
+                    if _vid_pos >= 0:
+                        _vid = _line_upper[_vid_pos:_vid_pos + 8]  # e.g. "VID_32E4"
+
+                    # Assign role by VID
+                    if _LOGITECH_VID in _vid and narrow_idx is None:
+                        narrow_idx = _dshow_idx
+                        print(f"  [{_dshow_idx}] NARROW/IR: {_last_name}  ({_vid})")
+                    elif _SVPRO_VID in _vid and external_idx is None:
+                        external_idx = _dshow_idx
+                        print(f"  [{_dshow_idx}] EXTERNAL:  {_last_name}  ({_vid})")
+                    elif any(v in _vid for v in _INTERNAL_VIDS) and internal_idx is None:
+                        internal_idx = _dshow_idx
+                        print(f"  [{_dshow_idx}] INTERNAL:  {_last_name}  ({_vid})")
+                    else:
+                        if external_idx is None:
+                            external_idx = _dshow_idx
+                        elif internal_idx is None:
+                            internal_idx = _dshow_idx
+                        print(f"  [{_dshow_idx}] OTHER:     {_last_name}  ({_vid})")
+
+                    _dshow_idx += 1
+                    _last_name = ""
+        except Exception as e:
+            print(f"[Camera] ffmpeg enumeration failed: {e}")
+
+    # Fallback: no ffmpeg or no results — probe and guess
+    if external_idx is None:
+        print("[Camera] Fallback — probing DirectShow indices ...")
+        devices = _query_pnp_cameras()
+        _probe_range = list(range(len(devices))) if devices else list(range(8))
+        for idx in _probe_range:
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
             ret, _ = cap.read()
+            cap.release()
             if ret:
-                good += 1
-        elapsed = _time.perf_counter() - t0
-        cap.release()
-        if good >= 3:
-            measured = good / elapsed if elapsed > 0 else 0
-            results.append((idx, measured))
-            print(f"  [{idx}] measured {measured:.1f} fps ({good} frames in {elapsed:.2f}s)")
+                if external_idx is None:
+                    external_idx = idx
+                elif internal_idx is None:
+                    internal_idx = idx
 
-    if not results:
-        raise RuntimeError(
-            "No cameras found. Plug in the USB camera, or set CAMERA_INDEX "
-            "to an integer in config.py."
-        )
+    if external_idx is None:
+        raise RuntimeError("No external camera found.")
 
-    # --- Pick the SVPRO: highest actual FPS (should be ~60, webcam ~30) ---
-    results.sort(key=lambda x: x[1], reverse=True)
-    external_idx = results[0][0]
-    internal_idx = results[1][0] if len(results) > 1 else None
-
-    print(f"[Camera] Selected — Turret (external): index {external_idx} "
-          f"({results[0][1]:.0f} fps), "
-          f"Head tracking (internal): index {internal_idx}"
-          + (f" ({results[1][1]:.0f} fps)" if internal_idx is not None else ""))
-    return external_idx, internal_idx
+    print(f"[Camera] Selected — Turret (wide): index {external_idx}, "
+          f"Head tracking: index {internal_idx}, "
+          f"Narrow/IR: index {narrow_idx if narrow_idx is not None else 'not found'}")
+    return external_idx, internal_idx, narrow_idx
 
 
 # ---------------------------------------------------------------------------
@@ -1874,9 +2122,10 @@ def main():
 
     # ── resolve camera indices ──
     internal_cam_index = None
+    narrow_cam_index = None
     if config.CAMERA_INDEX == "auto_external":
         try:
-            cam_index, internal_cam_index = _find_cameras()
+            cam_index, internal_cam_index, narrow_cam_index = _find_cameras()
         except RuntimeError as exc:
             print(f"[Main] ERROR: {exc}")
             sys.exit(1)
@@ -1903,7 +2152,24 @@ def main():
     actual_w   = int(_camera.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h   = int(_camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = _camera.get(cv2.CAP_PROP_FPS)
-    print(f"[Main] Camera opened (index {cam_index}): {actual_w}×{actual_h} @ {actual_fps:.0f}fps")
+    print(f"[Main] Wide camera opened (index {cam_index}): {actual_w}×{actual_h} @ {actual_fps:.0f}fps")
+
+    # ── open narrow/IR camera (Logitech C270) if found ──
+    _narrow_camera = None
+    if narrow_cam_index is not None:
+        _narrow_camera = cv2.VideoCapture(narrow_cam_index, cv2.CAP_DSHOW)
+        _narrow_camera.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAMERA_WIDTH)
+        _narrow_camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+        _narrow_camera.set(cv2.CAP_PROP_FPS,          30)
+        _narrow_camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if _narrow_camera.isOpened():
+            _nw = int(_narrow_camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+            _nh = int(_narrow_camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"[Main] Narrow/IR camera opened (index {narrow_cam_index}): {_nw}×{_nh}")
+            shared.narrow_cam_available = True
+        else:
+            print(f"[Main] WARNING: Could not open narrow camera index {narrow_cam_index}")
+            _narrow_camera = None
 
     # ── subsystems ──
     tracker    = Tracker()
@@ -1929,6 +2195,16 @@ def main():
         name="Capture",
     )
     cap_thread.start()
+
+    # ── Narrow/IR camera capture thread ──
+    if _narrow_camera is not None:
+        narrow_thread = threading.Thread(
+            target=_narrow_capture_thread,
+            args=(_narrow_camera,),
+            daemon=True,
+            name="NarrowCapture",
+        )
+        narrow_thread.start()
 
     # ── Wait for first frame ──
     print("[Main] Waiting for first frame ...")

@@ -30,7 +30,7 @@ CAMERA_TILT_DEG_PER_PX = 67.5 / 720.0    # ~0.094 (derived from 16:9 aspect rati
 CAMERA_CALIBRATED      = False            # True after running B-key calibration
 
 YOLO_MODEL_PATH        = "yolov8n-pose.pt"
-CONFIDENCE_THRESHOLD   = 0.5
+CONFIDENCE_THRESHOLD   = 0.4
 
 # --------------- Gearing ---------------
 PAN_GEAR_RATIO   = 98.0 / 18.0   # ≈ 5.4444 — motor revs per camera rev
@@ -59,13 +59,13 @@ SWAP_PAN_TILT = False
 # --------------- PD defaults ---------------
 # Pan axis (helical gear, 98:18 ratio, 1/8 microstep)
 # Arduino ceiling: 15000 sps = ~621 deg/sec camera-side.
-PAN_KP  = 167.0    # user-tuned value
-PAN_KD  = 8.0      # was 4 — scaled with Kp to maintain damping ratio
+PAN_KP  = 300.0    # increased for faster tracking at distance
+PAN_KD  = 14.0     # scaled with Kp (Kd/Kp ≈ 0.047) to prevent overshoot
 
 # Tilt axis (20:1 worm gear, full step)
 # Arduino ceiling: 8000 sps = ~720 deg/sec motor = 36 deg/sec camera.
 TILT_KP = 600.0
-TILT_KD = 6.0      # was 4 — slightly more damping for worm gear rigidity
+TILT_KD = 12.0     # increased to prevent tilt overshoot (worm gear has low inertia)
 
 # Maximum output velocity (deg/sec) before steps/sec conversion
 # Pan capped to match Arduino PAN_MAX_SPEED (15000 sps → ~621 deg/sec)
@@ -168,7 +168,7 @@ DISTANCE_FAR_M            = 8.0    # > 8m = FAR, between = MEDIUM
 # LEAD_GAIN: how many frames ahead to aim (scales with target velocity).
 #   0.0 = disabled (pure reactive), 3.0 = lead by ~3 frames of target motion.
 # LEAD_EMA: smoothing on the velocity estimate (0.0–1.0, higher = less noise).
-SNAP_THRESHOLD  = 0.08   # normalized error above this → bypass EMA, instant snap
+SNAP_THRESHOLD  = 0.04   # normalized error above this → bypass EMA, instant snap
 
 LEAD_GAIN       = 0.0    # (legacy, unused) frames ahead to aim
 LEAD_ACCEL_GAIN = 0.0    # (legacy, unused)
@@ -208,6 +208,13 @@ CAMERA_AUTO_EXPOSURE = True
 # 0 = disabled.  100–120 works well for YOLO pose detection indoors.
 AUTO_BRIGHTNESS_TARGET = 110  # 0-255; set to 0 to disable software normalization
 
+# --------------- Crosshair offset ---------------
+# Pixel offset to fine-tune where the crosshair sits on the frame.
+# Positive X = shift right, positive Y = shift down.
+# Persists across runs — adjust once to align with barrel/optic.
+CROSSHAIR_OFFSET_X = 22   # pixels (right)
+CROSSHAIR_OFFSET_Y = -5   # pixels (up)
+
 # --------------- Misc ---------------
 # Delay (ms) after motor re-enable before sending velocity commands
 MOTOR_ENABLE_DELAY_MS = 20
@@ -229,3 +236,13 @@ HAND_CONTROL_DEADZONE   = 0.12   # normalized deadzone — ignore small movement
 HAND_CONTROL_EMA        = 0.5    # smoothing on hand/head position (0–1, higher = faster)
 HAND_CONTROL_CAM_INDEX  = 0      # built-in webcam index (0 = first/internal camera)
 HAND_CONTROL_FPS        = 15     # detection rate limit (Hz)
+
+# --------------- Scan mode ---------------
+# Serpentine scan pattern: sweeps pan left/right, steps tilt down each row.
+# Activates with G key. Auto-pauses when a target is detected, resumes when lost.
+SCAN_PAN_RANGE     = 15.0    # ±degrees from center for pan sweep
+SCAN_TILT_RANGE    = 15.0    # ±degrees from center for tilt sweep
+SCAN_PAN_SPEED     = 15.0    # deg/sec for pan sweep — slow, deliberate search
+SCAN_TILT_STEP     = 2.0     # degrees to step down in tilt after each pan sweep
+SCAN_PAUSE_ON_TARGET = True  # auto-pause scan when a target is detected
+SCAN_RESUME_ON_LOST  = True  # auto-resume scan when target is lost

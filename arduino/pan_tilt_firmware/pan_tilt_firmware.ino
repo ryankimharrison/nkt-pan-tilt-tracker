@@ -47,9 +47,9 @@
 
 // ===== MOTOR CONFIGURATION =====
 #define PAN_MAX_SPEED     15000  // steps/sec ceiling (~562 RPM at 1/8 step)
-#define PAN_ACCELERATION  20000  // steps/sec^2
+#define PAN_ACCELERATION  35000  // steps/sec^2 — helical gear handles fast ramp
 #define TILT_MAX_SPEED    8000
-#define TILT_ACCELERATION 12000
+#define TILT_ACCELERATION 18000  // worm gear is rigid, can ramp faster
 
 // Commands below this threshold (steps/sec) are treated as zero.
 // Prevents detection noise from generating tiny coil pulses when the
@@ -120,6 +120,8 @@ void emergencyStop() {
     panStepper.setSpeed(0.0f);
     tiltStepper.setSpeed(0.0f);
     enableMotors(false);
+    digitalWrite(SIGNAL_PIN, LOW);   // clear fire/piezo pin
+    piezoActive = false;
 }
 
 // ---------- serial command processing ----------
@@ -141,7 +143,7 @@ void processCommand(const char* cmd) {
     if (cmd[0] == 'E') {
         if (cmd[1] == '0') {
             enableMotors(true);
-            delay(50);
+            delay(2);  // DRV8825 needs ~1.7ms after enable before stepping
         } else if (cmd[1] == '1') {
             targetPanSpeed   = 0.0f;
             targetTiltSpeed  = 0.0f;

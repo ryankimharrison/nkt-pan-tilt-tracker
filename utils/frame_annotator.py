@@ -269,10 +269,14 @@ def annotate(
     cal_click_px:          tuple | None = None,
     ballistic_lead_px:     tuple = (0.0, 0.0),
     ballistic_active:      bool = False,
+    vel_px:                tuple = (0.0, 0.0),
+    predict_px:            tuple = (0.0, 0.0),
+    using_narrow_cam:      bool = False,
 ) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
-    cx_frame, cy_frame = w // 2, h // 2
+    cx_frame = w // 2 + config.CROSSHAIR_OFFSET_X
+    cy_frame = h // 2 + config.CROSSHAIR_OFFSET_Y
     p = params or {}
 
     # ── cv2 geometric drawing (fast, stays on numpy) ──
@@ -381,6 +385,44 @@ def annotate(
         cv2.circle(out, (tcx, tcy), 6, _BLACK,  1)
         cv2.arrowedLine(out, (cx_frame, cy_frame), (tcx, tcy), _ORANGE, 1,
                         cv2.LINE_AA, tipLength=0.15)
+
+    # Velocity arrow — shows direction and speed of target motion
+    if target is not None:
+        _vx, _vy = vel_px
+        _speed_px = (_vx ** 2 + _vy ** 2) ** 0.5
+        if _speed_px > 30:  # only draw when target is visibly moving
+            tcx, tcy = int(target.aim_cx), int(target.aim_cy)
+            # Scale: 0.1 seconds of motion = arrow length
+            _arrow_scale = 0.1
+            _ax = int(tcx + _vx * _arrow_scale)
+            _ay = int(tcy + _vy * _arrow_scale)
+            # Clamp to frame
+            _ax = max(5, min(w - 5, _ax))
+            _ay = max(5, min(h - 5, _ay))
+            # Yellow arrow from target center in direction of motion
+            _VEL_CLR = (0, 255, 255)  # yellow BGR
+            cv2.arrowedLine(out, (tcx, tcy), (_ax, _ay), _VEL_CLR, 2,
+                            cv2.LINE_AA, tipLength=0.25)
+            # Speed label near arrow tip
+            _spd_label = f"{_speed_px:.0f} px/s"
+            cv2.putText(out, _spd_label, (_ax + 8, _ay - 4),
+                        _CV_FONT, 0.35, _VEL_CLR, 1, cv2.LINE_AA)
+
+        # Prediction compensation marker — small + where the aim is shifted to
+        _px, _py = predict_px
+        if abs(_px) > 1 or abs(_py) > 1:
+            _pred_x = int(cx_frame + _px)
+            _pred_y = int(cy_frame + _py)
+            _pred_x = max(5, min(w - 5, _pred_x))
+            _pred_y = max(5, min(h - 5, _pred_y))
+            # Small green + marker showing prediction shift
+            _PRED_CLR = (0, 255, 100)  # bright green
+            cv2.drawMarker(out, (_pred_x, _pred_y), _PRED_CLR,
+                           cv2.MARKER_CROSS, 10, 1, cv2.LINE_AA)
+            _comp_ms = config.PREDICTION_EXTRA_MS + 16  # approx total
+            cv2.putText(out, f"PRED +{_comp_ms:.0f}ms",
+                        (_pred_x + 8, _pred_y + 4),
+                        _CV_FONT, 0.3, _PRED_CLR, 1, cv2.LINE_AA)
 
     # Waypoint dots — project from world angles to current pixel positions
     _wp_px_list = []
@@ -587,6 +629,8 @@ def annotate(
          _SUCCESS_RGB if (tracking_enabled and not is_idle) else (_GRAY_RGB if is_idle else _RED_RGB), False),
         (f"Motor:   {'ENABLED' if motor_enabled else 'DISABLED'}",
          _SUCCESS_RGB if motor_enabled else _RED_RGB, False),
+        (f"Camera:  {'NARROW/IR' if using_narrow_cam else 'WIDE 120°'}",
+         (0, 200, 255) if using_narrow_cam else _SUCCESS_RGB, False),
         (f"Safety:  ENABLED",                                            _SUCCESS_RGB, False),
     ]
     _draw_text_block(draw, right_data, rx_base, ry, lh, _F14, _F14B)
@@ -611,7 +655,7 @@ def annotate(
 
     # ── Bottom legend ──
     leg1 = "[W/A/S/D] Move Camera   [T] Toggle Tracking   [Tab] Next Target   [F] Fire Mode   [P] Ballistic Lead   [L] Set Boundaries   [I] System Info"
-    leg2 = "[Space] Manual Fire   [N] Force Engage   [H] Hand/Head   [E] Emergency Shutoff   [R] Re-center   [Z] Reset Axes   [V] Waypoint   [Q] Exit"
+    leg2 = "[Space] Manual Fire   [N] Force Engage   [H] Hand/Head   [G] Scan   [E] Emergency Shutoff   [R] Re-center   [Z] Reset Axes   [V] Waypoint   [Q] Exit"
     draw.text((16, leg_y0 + 4), leg1, font=_F12, fill=(*_GRAY_RGB, 220))
     draw.text((16, leg_y0 + 19), leg2, font=_F12, fill=(*_GRAY_RGB, 220))
 
