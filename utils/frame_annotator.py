@@ -272,6 +272,7 @@ def annotate(
     vel_px:                tuple = (0.0, 0.0),
     predict_px:            tuple = (0.0, 0.0),
     using_narrow_cam:      bool = False,
+    reid_names:            dict = None,
 ) -> np.ndarray:
     out = frame.copy()
     h, w = out.shape[:2]
@@ -291,16 +292,19 @@ def annotate(
     for t in tracks:
         x1, y1, x2, y2 = int(t.x1), int(t.y1), int(t.x2), int(t.y2)
         is_tgt = target is not None and t.track_id == target.track_id
+        _rn = reid_names or {}
         if is_tgt:
             cv2.rectangle(out, (x1, y1), (x2, y2), _GREEN, 2)
             _corner_accents(out, x1, y1, x2, y2, _GREEN)
-            label = f"ID {t.track_id}  {t.conf:.2f}"
+            _name = _rn.get(t.global_id, f"P{t.global_id}" if t.global_id >= 0 else f"ID {t.track_id}")
+            label = f"{_name}  {t.conf:.2f}"
             (lw, lh), _ = cv2.getTextSize(label, _CV_FONT, 0.45, 1)
             cv2.rectangle(out, (x1, y1 - lh - 6), (x1 + lw + 4, y1), _GREEN, -1)
             cv2.putText(out, label, (x1 + 2, y1 - 4), _CV_FONT, 0.45, _BLACK, 1, cv2.LINE_AA)
         else:
             cv2.rectangle(out, (x1, y1), (x2, y2), _GRAY, 1)
-            cv2.putText(out, str(t.track_id), (x1 + 2, y1 + 14), _CV_FONT, 0.45, _GRAY, 1, cv2.LINE_AA)
+            _name = _rn.get(t.global_id, f"P{t.global_id}" if t.global_id >= 0 else str(t.track_id))
+            cv2.putText(out, _name, (x1 + 2, y1 + 14), _CV_FONT, 0.45, _GRAY, 1, cv2.LINE_AA)
 
     # Tactical crosshair reticle
     _cx, _cy = cx_frame, cy_frame
@@ -637,7 +641,9 @@ def annotate(
 
     # ── Biometric scan ──
     if target is not None:
-        bio_txt = f"BIOMETRIC SCAN: LOCKED [ID {target.track_id}]"
+        _rn2 = reid_names or {}
+        _bio_name = _rn2.get(target.global_id, f"P{target.global_id}" if target.global_id >= 0 else f"ID {target.track_id}")
+        bio_txt = f"BIOMETRIC SCAN: LOCKED [{_bio_name}]"
         bio_clr = _SUCCESS_RGB
     else:
         bio_txt = "BIOMETRIC SCAN: NO TARGET"
@@ -655,7 +661,7 @@ def annotate(
 
     # ── Bottom legend ──
     leg1 = "[W/A/S/D] Move Camera   [T] Toggle Tracking   [Tab] Next Target   [F] Fire Mode   [P] Ballistic Lead   [L] Set Boundaries   [I] System Info"
-    leg2 = "[Space] Manual Fire   [N] Force Engage   [H] Hand/Head   [G] Scan   [E] Emergency Shutoff   [R] Re-center   [Z] Reset Axes   [V] Waypoint   [Q] Exit"
+    leg2 = "[Space] Manual Fire   [N] Force Engage   [H] Hand/Head   [G] Scan   [U] Name Person   [E] E-Stop   [R] Re-center   [V] Waypoint   [Q] Exit"
     draw.text((16, leg_y0 + 4), leg1, font=_F12, fill=(*_GRAY_RGB, 220))
     draw.text((16, leg_y0 + 19), leg2, font=_F12, fill=(*_GRAY_RGB, 220))
 

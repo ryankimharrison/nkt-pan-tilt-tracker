@@ -29,7 +29,7 @@ CAMERA_PAN_DEG_PER_PX  = 120.0 / 1280.0   # ~0.094 (120° HFOV)
 CAMERA_TILT_DEG_PER_PX = 67.5 / 720.0    # ~0.094 (derived from 16:9 aspect ratio)
 CAMERA_CALIBRATED      = False            # True after running B-key calibration
 
-YOLO_MODEL_PATH        = "yolov8n-pose.pt"
+YOLO_MODEL_PATH        = "yolov8n-pose.pt"  # use .engine for TensorRT (~3x faster) when running from project dir
 CONFIDENCE_THRESHOLD   = 0.4
 
 # --------------- Gearing ---------------

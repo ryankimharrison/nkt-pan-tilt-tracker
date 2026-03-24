@@ -41,6 +41,8 @@ class Track:
     aim_cy: float = 0.0
     # Pose keypoints: list of (x, y, conf) for 17 COCO points, or None
     keypoints: list[tuple[float, float, float]] | None = None
+    # Global person ID from ReID system (persistent across cameras/re-entry)
+    global_id: int = -1
 
     @property
     def cx(self) -> float:

@@ -1,6 +1,6 @@
-# Last edited: 2026-03-23 ~6:15 AM
-# Smart confidence-based camera switching (wide↔narrow), detection hysteresis, bbox-center fallback when keypoints are noisy.
-# ffmpeg-based DirectShow device enumeration for reliable VID-based camera identification.
+# Last edited: 2026-03-23 ~6:45 AM
+# Integrated OSNet person re-identification for cross-camera matching and re-entry detection.
+# Global person IDs (P1, P2...) persist across camera switches and track loss/re-acquisition.
 
 """
 main.py — Entry point for the pan-tilt tracker.
@@ -62,6 +62,7 @@ from utils.fps_counter import FPSCounter
 import utils.frame_annotator as annotator
 from psl_analyzer import PSLAnalyzer, draw_psl_overlay
 from hand_head_controller import HandHeadController
+from person_reid import PersonReID
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +124,9 @@ class SharedState:
         # Scan mode
         self.scan_active = False
         self.scan_paused = False  # True when paused because target detected
+
+        # ReID
+        self.reid_target_global_id = -1  # current target's global person ID
 
         # Narrow/IR camera (Logitech C270)
         self.narrow_cam_available = False
@@ -357,6 +361,7 @@ def _processing_thread(
     fps_inference: FPSCounter,
     fps_loop:      FPSCounter,
     psl:        "PSLAnalyzer",
+    reid:       "PersonReID | None" = None,
 ):
     print("[Processing] Thread started.")
     centered_frames = 0
@@ -397,6 +402,11 @@ def _processing_thread(
     _narrow_confidence = 0.0    # 0-1, how confident we are narrow is better (ramps up/down)
     _wide_confidence = 1.0      # 0-1, how confident we are wide is better
     _frames_on_current_cam = 0  # frames since last switch
+
+    # ReID state
+    _reid_target_global_id = -1   # current target's global person ID
+    _reid_last_update = 0.0       # last time we updated the target's embedding
+    _reid_frame_ctr = 0           # frames since last ReID computation
 
     # Hand/head position control state
     _hh_pos_initialized = False
@@ -486,6 +496,42 @@ def _processing_thread(
 
         # When tracking is disabled OR limits not calibrated, suppress target so PID stays zero
         target = track_result.target if (shared.tracking_enabled and shared.limits_calibrated) else None
+
+        # ── ReID: assign global person IDs ──
+        _reid_frame_ctr += 1
+        if reid is not None and reid.ready:
+            # Assign global IDs to all tracks (every 5 frames to save compute)
+            if _reid_frame_ctr % 5 == 0:
+                for t in tracks:
+                    bbox = (int(t.x1), int(t.y1), int(t.x2), int(t.y2))
+                    emb = reid.compute_embedding(frame, bbox)
+                    if emb is not None:
+                        gid = reid.register(t.track_id, emb)
+                        t.global_id = gid
+
+            # Update target's embedding more frequently
+            if target is not None:
+                if target.global_id < 0:
+                    # First time seeing this target — compute immediately
+                    bbox = (int(target.x1), int(target.y1), int(target.x2), int(target.y2))
+                    emb = reid.compute_embedding(frame, bbox)
+                    if emb is not None:
+                        gid = reid.register(target.track_id, emb)
+                        target.global_id = gid
+                        _reid_target_global_id = gid
+                        shared.reid_target_global_id = gid
+                else:
+                    _reid_target_global_id = target.global_id
+                    shared.reid_target_global_id = target.global_id
+                    # Periodic update (every 30 frames ≈ 0.5s)
+                    if _reid_frame_ctr % 30 == 0:
+                        bbox = (int(target.x1), int(target.y1), int(target.x2), int(target.y2))
+                        emb = reid.compute_embedding(frame, bbox)
+                        if emb is not None:
+                            reid.update(target.global_id, emb)
+            else:
+                # Target lost — try to re-identify on next acquisition
+                pass
 
         # ── Smart camera switching (wide ↔ narrow) ──
         # Switch TO narrow when: target locked, near center (within 15% of frame),
@@ -1100,6 +1146,8 @@ def _processing_thread(
                 "predict_px": (aim_cx - target.aim_cx if target else 0.0,
                                aim_cy - target.aim_cy if target else 0.0),
                 "using_narrow_cam": shared.using_narrow_cam,
+                "reid_names": {t.global_id: reid.get_display_name(t.global_id)
+                               for t in tracks if t.global_id >= 0} if reid and reid.ready else {},
             },
         }
 
@@ -1484,7 +1532,7 @@ def _setup_trackbars(controller: MotionController):
         cv2.createTrackbar(tb_name, _CTRL_WINDOW, init_val, tb_max, cb)
 
 
-def _display_loop(controller: MotionController):
+def _display_loop(controller: MotionController, reid: "PersonReID | None" = None):
     """
     Main-thread display loop.
     Camera window = exact frame size (WINDOW_AUTOSIZE, no trackbars).
@@ -1899,6 +1947,42 @@ def _display_loop(controller: MotionController):
             else:
                 shared.scan_paused = False
                 print("[Display] Scan mode OFF")
+        elif _key_down and (key == ord('u') or key == ord('U')):
+            # Name the currently tracked person
+            _gid = shared.reid_target_global_id
+            if reid is not None and reid.ready and _gid > 0:
+                _cur_name = reid.get_display_name(_gid)
+                _name_buf = ""
+                _naming = True
+                _name_win = "Name Person"
+                while _naming:
+                    _name_img = np.zeros((80, 400, 3), dtype=np.uint8)
+                    cv2.putText(_name_img, f"Name {_cur_name}:", (10, 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                    cv2.putText(_name_img, _name_buf + "_", (10, 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    cv2.imshow(_name_win, _name_img)
+                    k2 = cv2.waitKey(30) & 0xFF
+                    if k2 == 13:  # Enter
+                        _naming = False
+                    elif k2 == 27:  # Escape
+                        _name_buf = ""
+                        _naming = False
+                    elif k2 == 8:  # Backspace
+                        _name_buf = _name_buf[:-1]
+                    elif 32 <= k2 < 127:
+                        _name_buf += chr(k2)
+                try:
+                    cv2.destroyWindow(_name_win)
+                except cv2.error:
+                    pass
+                if _name_buf.strip():
+                    reid.set_name(_gid, _name_buf.strip())
+                    print(f"[Display] Person {_cur_name} named '{_name_buf.strip().upper()}'")
+                else:
+                    print("[Display] Naming cancelled")
+            else:
+                print("[Display] U key: no target locked or ReID not ready")
 
         _prev_key = key
 
@@ -2175,6 +2259,8 @@ def main():
     tracker    = Tracker()
     controller = MotionController()
     psl        = PSLAnalyzer()
+    reid       = PersonReID()
+    reid.start()  # loads OSNet in background
     psl.start()
     _hand_head.set_camera_index(internal_cam_index, exclude=cam_index)
     _hand_head.start()
@@ -2223,7 +2309,7 @@ def main():
     # ── Thread 2: Processing (background) ──
     proc_thread = threading.Thread(
         target=_processing_thread,
-        args=(tracker, controller, _serial, fps_capture, fps_inference, fps_loop, psl),
+        args=(tracker, controller, _serial, fps_capture, fps_inference, fps_loop, psl, reid),
         daemon=True,
         name="Processing",
     )
@@ -2239,7 +2325,7 @@ def main():
     ann_thread.start()
 
     # ── Main thread: OpenCV display + trackbars + keyboard ──
-    _display_loop(controller)
+    _display_loop(controller, reid)
 
 
 if __name__ == "__main__":
