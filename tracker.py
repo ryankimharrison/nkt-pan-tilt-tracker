@@ -17,6 +17,25 @@ _LOCAL_BYTETRACK = os.path.join(os.path.dirname(__file__), "bytetrack.yaml")
 _BYTETRACK_CFG   = _LOCAL_BYTETRACK if os.path.isfile(_LOCAL_BYTETRACK) else "bytetrack.yaml"
 
 
+def _resolve_model_path(configured_path: str) -> str:
+    """
+    If config points to a .pt file, check whether a pre-built TensorRT .engine
+    exists alongside it and prefer that for ~3x faster inference.
+    Falls back to the .pt file if no engine is found.
+    """
+    if configured_path.endswith(".engine"):
+        return configured_path  # explicit engine path — use as-is
+
+    engine_path = os.path.splitext(configured_path)[0] + ".engine"
+    if os.path.isfile(engine_path):
+        print(f"[Tracker] TensorRT engine found: {engine_path}")
+        return engine_path
+
+    print(f"[Tracker] No TensorRT engine found at '{engine_path}' — using {configured_path}")
+    print("[Tracker] Run export_engine.py once to build it for ~3x faster inference.")
+    return configured_path
+
+
 # COCO pose keypoint indices (0-based)
 LEFT_SHOULDER  = 5
 RIGHT_SHOULDER = 6
@@ -77,8 +96,9 @@ class Tracker:
 
     def __init__(self):
         from ultralytics import YOLO
-        print(f"[Tracker] Loading model: {config.YOLO_MODEL_PATH}")
-        self._model = YOLO(config.YOLO_MODEL_PATH)
+        model_path = _resolve_model_path(config.YOLO_MODEL_PATH)
+        print(f"[Tracker] Loading model: {model_path}")
+        self._model = YOLO(model_path)
         print("[Tracker] Model loaded.")
 
         self._target_id:      int | None = None
@@ -106,13 +126,13 @@ class Tracker:
         """
         h, w = frame_shape
 
-        # Use lower conf for YOLO to let ByteTrack see marginal detections.
-        # Filter in _parse_results: tracked targets keep at lower threshold (hysteresis).
-        _keep_conf = config.CONFIDENCE_THRESHOLD * 0.6  # ~0.24 — keep threshold
+        # Hysteresis: YOLO runs at slightly lower conf to let ByteTrack see marginal detections.
+        # _parse_results filters: new targets need full conf, tracked target keeps at lower conf.
+        _keep_conf = max(0.25, config.CONFIDENCE_THRESHOLD * 0.75)  # ~0.30
         results = self._model.track(
             frame,
             classes=[0],                         # person only
-            conf=_keep_conf,                     # low threshold — ByteTrack handles persistence
+            conf=_keep_conf,                     # slightly below main threshold
             persist=True,                        # maintains IDs across frames
             tracker=_BYTETRACK_CFG,
             imgsz=config.CAMERA_WIDTH,           # run inference at full camera resolution

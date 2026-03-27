@@ -1,9 +1,12 @@
-# Last edited: 2026-03-23 ~6:45 AM
-# Integrated OSNet person re-identification for cross-camera matching and re-entry detection.
-# Global person IDs (P1, P2...) persist across camera switches and track loss/re-acquisition.
+# Last edited: 2026-03-27 ~2:30 AM
+# Ballistic lead fix: unified System A + B into single lead calculation.
+# When ballistic is stable, all lead (pipeline + flight) uses ego-compensated
+# velocity from PD output.  System A (pixel-based) disabled to kill noise.
+# Added dynamic pipeline latency measurement (capture→serial EMA).
+# Faster convergence: VEL_ALPHA 0.08→0.20, MIN_STABILITY 15→10.
 
 """
-main.py — Entry point for the pan-tilt tracker.
+main.py  — Entry point for the pan-tilt tracker.
 
 Thread layout
 -------------
@@ -121,15 +124,16 @@ class SharedState:
 
         self._wp_close_requested = False
 
-        # Scan mode
+        # Scan mode (ReID data collection)
         self.scan_active = False
-        self.scan_paused = False  # True when paused because target detected
 
         # ReID
         self.reid_target_global_id = -1  # current target's global person ID
 
         # Narrow/IR camera (Logitech C270)
         self.narrow_cam_available = False
+        self.narrow_cam_index = None   # DirectShow index, set at startup
+        self.narrow_cam_opened = False # True once camera + capture thread started
         self.using_narrow_cam = False  # True when precision tracking with narrow cam
         self.narrow_frame = None       # latest frame from narrow camera
         self.narrow_frame_lock = threading.Lock()
@@ -284,7 +288,8 @@ def _annotation_thread(psl: "PSLAnalyzer"):
 
         try:
             ann = annotator.annotate(**job["annotate_kwargs"])
-            draw_psl_overlay(ann, psl.get_result(), analyzer=psl)
+            if psl is not None:
+                draw_psl_overlay(ann, psl.get_result(), analyzer=psl)
 
             # Pin 12 fire indicator
             p12 = job.get("pin12")
@@ -386,14 +391,12 @@ def _processing_thread(
     _bl_blend_factor  = 0.0            # 0.0 = no lead, 1.0 = full lead (ramps in/out)
     _bl_blend_time_start = 0.0         # when blend started ramping
 
-    # Scan mode state
-    _scan_pan_deg    = 0.0     # current virtual pan position (degrees from start)
-    _scan_tilt_deg   = 0.0     # current virtual tilt position
+    # Scan mode state (ReID data collection)
+    _scan_pan_deg    = 0.0     # current pan position (degrees from start, -60 to +60)
     _scan_pan_dir    = 1.0     # +1 = sweeping right, -1 = sweeping left
     _scan_initialized = False
-    _scan_tilt_stepping = False  # True while tilt is stepping between rows
-    _scan_tilt_step_target = 0.0
-    _scan_tilt_step_start = 0.0
+    _scan_people_seen: dict[int, int] = {}  # {bytetrack_id: global_reid_id} seen during scan
+    _scan_embed_count = 0      # total embeddings collected this scan
 
     # Narrow camera probe: periodically try narrow when wide sees nothing
     _narrow_probe_ctr = 0       # frames with no detection on wide
@@ -402,6 +405,9 @@ def _processing_thread(
     _narrow_confidence = 0.0    # 0-1, how confident we are narrow is better (ramps up/down)
     _wide_confidence = 1.0      # 0-1, how confident we are wide is better
     _frames_on_current_cam = 0  # frames since last switch
+
+    # Dynamic pipeline latency measurement (capture → serial send)
+    _pipe_ema = 0.05              # EMA of measured pipeline latency (initial guess: 50ms)
 
     # ReID state
     _reid_target_global_id = -1   # current target's global person ID
@@ -460,9 +466,10 @@ def _processing_thread(
         if pending:
             controller.update_params(**pending)
 
+        # ── timing debug (prints once per 120 frames) ──
+        _t_loop_start = time.perf_counter()
+
         # ── grab latest frame ──
-        # If narrow camera is available and we have a locked target, use it
-        # for precision tracking. Otherwise use the wide camera.
         _use_narrow = (shared.narrow_cam_available
                        and shared.using_narrow_cam
                        and shared.narrow_frame is not None)
@@ -497,41 +504,27 @@ def _processing_thread(
         # When tracking is disabled OR limits not calibrated, suppress target so PID stays zero
         target = track_result.target if (shared.tracking_enabled and shared.limits_calibrated) else None
 
-        # ── ReID: assign global person IDs ──
+        # ── ReID: assign global person IDs (lightweight, target only) ──
         _reid_frame_ctr += 1
-        if reid is not None and reid.ready:
-            # Assign global IDs to all tracks (every 5 frames to save compute)
-            if _reid_frame_ctr % 5 == 0:
-                for t in tracks:
-                    bbox = (int(t.x1), int(t.y1), int(t.x2), int(t.y2))
-                    emb = reid.compute_embedding(frame, bbox)
-                    if emb is not None:
-                        gid = reid.register(t.track_id, emb)
-                        t.global_id = gid
-
-            # Update target's embedding more frequently
-            if target is not None:
-                if target.global_id < 0:
-                    # First time seeing this target — compute immediately
+        if reid is not None and reid.ready and target is not None:
+            if target.global_id < 0:
+                # New target — compute embedding and register immediately
+                bbox = (int(target.x1), int(target.y1), int(target.x2), int(target.y2))
+                emb = reid.compute_embedding(frame, bbox)
+                if emb is not None:
+                    gid = reid.register(target.track_id, emb)
+                    target.global_id = gid
+                    _reid_target_global_id = gid
+                    shared.reid_target_global_id = gid
+            elif target.global_id >= 0:
+                _reid_target_global_id = target.global_id
+                shared.reid_target_global_id = target.global_id
+                # Periodic update (every 60 frames ≈ 1s)
+                if _reid_frame_ctr % 60 == 0:
                     bbox = (int(target.x1), int(target.y1), int(target.x2), int(target.y2))
                     emb = reid.compute_embedding(frame, bbox)
                     if emb is not None:
-                        gid = reid.register(target.track_id, emb)
-                        target.global_id = gid
-                        _reid_target_global_id = gid
-                        shared.reid_target_global_id = gid
-                else:
-                    _reid_target_global_id = target.global_id
-                    shared.reid_target_global_id = target.global_id
-                    # Periodic update (every 30 frames ≈ 0.5s)
-                    if _reid_frame_ctr % 30 == 0:
-                        bbox = (int(target.x1), int(target.y1), int(target.x2), int(target.y2))
-                        emb = reid.compute_embedding(frame, bbox)
-                        if emb is not None:
-                            reid.update(target.global_id, emb)
-            else:
-                # Target lost — try to re-identify on next acquisition
-                pass
+                        reid.update(target.global_id, emb)
 
         # ── Smart camera switching (wide ↔ narrow) ──
         # Switch TO narrow when: target locked, near center (within 15% of frame),
@@ -559,6 +552,21 @@ def _processing_thread(
                     _narrow_confidence = max(0.0, _narrow_confidence - 0.01)
 
                 if _narrow_confidence > 0.7 and _frames_on_current_cam > 30:
+                    # Open narrow camera on demand if not already open
+                    if not shared.narrow_cam_opened and shared.narrow_cam_index is not None:
+                        _nc = cv2.VideoCapture(shared.narrow_cam_index, cv2.CAP_DSHOW)
+                        _nc.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+                        _nc.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+                        _nc.set(cv2.CAP_PROP_FPS, 30)
+                        _nc.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                        if _nc.isOpened():
+                            shared.narrow_cam_opened = True
+                            threading.Thread(target=_narrow_capture_thread, args=(_nc,),
+                                             daemon=True, name="NarrowCapture").start()
+                            print(f"[Camera] Narrow camera opened (index {shared.narrow_cam_index})")
+                        else:
+                            print("[Camera] WARNING: Could not open narrow camera")
+                            shared.narrow_cam_available = False
                     shared.using_narrow_cam = True
                     _frames_on_current_cam = 0
                     _narrow_confidence = 1.0
@@ -585,6 +593,22 @@ def _processing_thread(
             if target is None and not shared.using_narrow_cam and not _narrow_probe_active:
                 _narrow_probe_ctr += 1
                 if _narrow_probe_ctr >= 90:  # ~1.5 sec no detection
+                    # Open narrow camera on demand if not already open
+                    if not shared.narrow_cam_opened and shared.narrow_cam_index is not None:
+                        _nc = cv2.VideoCapture(shared.narrow_cam_index, cv2.CAP_DSHOW)
+                        _nc.set(cv2.CAP_PROP_FRAME_WIDTH, config.CAMERA_WIDTH)
+                        _nc.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+                        _nc.set(cv2.CAP_PROP_FPS, 30)
+                        _nc.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                        if _nc.isOpened():
+                            shared.narrow_cam_opened = True
+                            threading.Thread(target=_narrow_capture_thread, args=(_nc,),
+                                             daemon=True, name="NarrowCapture").start()
+                            print(f"[Camera] Narrow camera opened for probe")
+                        else:
+                            shared.narrow_cam_available = False
+                            _narrow_probe_ctr = 0
+                            continue
                     _narrow_probe_active = True
                     _narrow_probe_frames = 0
                     shared.using_narrow_cam = True
@@ -605,7 +629,7 @@ def _processing_thread(
                     print("[Camera] Probe done — back to WIDE (nothing found)")
 
         # ── idle de-energize (fire only on the transition into idle) ──
-        _scanning = shared.scan_active and not shared.scan_paused
+        _scanning = shared.scan_active
         if (is_idle or not shared.tracking_enabled) and not _was_idle:
             if not _scanning:  # don't de-energize while scanning
                 if shared.motor_enabled:
@@ -682,25 +706,47 @@ def _processing_thread(
             _prev_detect_t = _now_t
             _had_target    = True
 
-            # Predict forward by measured pipeline latency
+            # ── Aim point prediction ──
+            #
+            # Two systems exist:
+            #   System A — pixel-velocity latency prediction (raw frame-to-frame deltas)
+            #   System B — ballistic lead (ego-compensated velocity from PD output)
+            #
+            # Problem: camera is on the turret, so at steady tracking ω_pixel ≈ 0
+            # (turret motion cancels target motion in image).  System A's pixel velocity
+            # is near-zero and contributes mostly noise.  System B uses the correct
+            # ego-compensated velocity but previously only covered flight time, not
+            # pipeline latency.
+            #
+            # Fix: when ballistic lead is stable, System B handles the FULL lead
+            # (pipeline + flight time) and System A is disabled to avoid noise.
+            # System A still runs as fallback when ballistic is off or ramping up.
             aim_cx = target.aim_cx
             aim_cy = target.aim_cy
-            if config.PREDICTION_ENABLED and _vel_stable_cnt >= config.PREDICTION_MIN_FRAMES:
+
+            # Determine if ballistic lead has reached stability (controls System A gating)
+            _bl_is_stable = (config.BALLISTIC_LEAD_ENABLED
+                             and _bl_stable_cnt >= config.BALLISTIC_MIN_STABILITY)
+
+            # System A — pixel-based latency prediction
+            # ONLY active when ballistic lead is OFF or still ramping up.
+            # When ballistic is stable, it handles pipeline latency itself, so
+            # System A would only inject ego-motion noise.
+            if (config.PREDICTION_ENABLED
+                    and _vel_stable_cnt >= config.PREDICTION_MIN_FRAMES
+                    and not _bl_is_stable):
                 frame_age = max(0.0, _now_t - _frame_time) if _frame_time > 0 else 0.0
                 predict_sec = frame_age + config.PREDICTION_EXTRA_MS / 1000.0
                 predict_sec = min(predict_sec, config.PREDICTION_MAX_SEC)
                 aim_cx += _vel_px_x * predict_sec
                 aim_cy += _vel_px_y * predict_sec
 
-            # ── Ballistic lead: shift aim point ahead for dart flight time ──
+            # ── System B — Ballistic lead: unified flight time + pipeline latency ──
             _bl_lead_px_x = 0.0
             _bl_lead_px_y = 0.0
-            if (config.BALLISTIC_LEAD_ENABLED
-                    and _bl_stable_cnt >= config.BALLISTIC_MIN_STABILITY
-                    and shared.est_distance_m > 0.5):
+            if (_bl_is_stable and shared.est_distance_m > 0.5):
                 # Flight time with drag model (sphere in air)
                 # F_drag = 0.5 * Cd * rho * A * v²
-                # a_drag = F_drag / m = (0.5 * Cd * rho * A / m) * v²
                 # k = 0.5 * Cd * rho * A / m  (drag constant)
                 # With drag: v(t) = v0 / (1 + k*v0*t), x(t) = ln(1 + k*v0*t) / k
                 # Solve for t when x(t) = distance: t = (exp(k*d) - 1) / (k*v0)
@@ -709,7 +755,6 @@ def _processing_thread(
                 if config.BALLISTIC_DRAG_MODEL and config.DART_MASS_KG > 0:
                     _A = math.pi * (config.DART_DIAMETER_M / 2.0) ** 2
                     _k = 0.5 * config.DART_CD * config.AIR_DENSITY * _A / config.DART_MASS_KG
-                    # t = (exp(k*d) - 1) / (k * v0)
                     _kd = _k * _dist
                     if _kd < 20:  # prevent overflow
                         _flight_sec = (math.exp(_kd) - 1.0) / (_k * _v0)
@@ -717,18 +762,33 @@ def _processing_thread(
                         _flight_sec = _dist / _v0  # fallback
                 else:
                     _flight_sec = _dist / _v0
-                # Lead offset in pixels
-                _bl_lead_px_x = _bl_vel_px_x * _flight_sec
-                _bl_lead_px_y = _bl_vel_px_y * _flight_sec
-                # Gravity drop compensation (tilt up to compensate for dart falling)
+
+                # Pipeline latency: use dynamic measurement (capture → serial send)
+                # _pipe_ema measures the real latency each frame; add Arduino-side
+                # offset for serial parsing + acceleration ramp start (~10ms).
+                _pipe_sec = _pipe_ema + config.PIPELINE_ARDUINO_OFFSET_MS / 1000.0
+
+                # Total lead time = flight + pipeline.  The target moves during BOTH
+                # intervals: pipeline is the delay before the turret responds to what
+                # the camera saw, flight is the delay before the gel ball arrives.
+                # θ_lead = ω_target × (t_pipe + t_flight)
+                _total_lead_sec = _flight_sec + _pipe_sec
+                _total_lead_sec = min(_total_lead_sec, config.BALLISTIC_MAX_LEAD_SEC)
+
+                # Lead offset in pixels (using ego-compensated velocity from PD output)
+                _bl_lead_px_x = _bl_vel_px_x * _total_lead_sec
+                _bl_lead_px_y = _bl_vel_px_y * _total_lead_sec
+
+                # Gravity drop compensation — uses flight_sec ONLY (gravity acts on the
+                # projectile during flight, not during pipeline delay)
                 if config.BALLISTIC_GRAVITY_COMP:
                     _drop_m = 0.5 * 9.81 * _flight_sec * _flight_sec
-                    # Convert meters of drop to pixels on screen
                     if shared.est_distance_m > 0.5:
                         _bbox_h_px_for_drop = target.y2 - target.y1
                         if _bbox_h_px_for_drop > 10:
                             _px_per_m = _bbox_h_px_for_drop / config.DISTANCE_PERSON_HEIGHT_M
                             _bl_lead_px_y -= _drop_m * _px_per_m  # negative = aim higher
+
                 # Clamp to max lead
                 _max_lead = config.BALLISTIC_MAX_LEAD_PX
                 _bl_lead_px_x = max(-_max_lead, min(_max_lead, _bl_lead_px_x))
@@ -996,70 +1056,95 @@ def _processing_thread(
             # Not in hand/head/waypoint mode — reset so we re-query on next entry
             _hh_pos_initialized = False
 
-        # ── Scan mode: serpentine sweep when no target ──
+        # ── Scan mode: ReID data collection sweep ──
+        # Pans 120° (±60° from center), collects embeddings from ALL visible
+        # people, never locks on or fires.  Two full sweeps (left→right→left)
+        # then auto-stops and saves profiles.
         if shared.scan_active:
-            if target is not None and config.SCAN_PAUSE_ON_TARGET:
-                # Target found — pause scan, let PID take over
-                if not shared.scan_paused:
-                    shared.scan_paused = True
-                    print("[Scan] Paused — target detected")
-            elif target is None and shared.scan_paused and config.SCAN_RESUME_ON_LOST:
-                shared.scan_paused = False
-                _scan_initialized = False  # re-query position on resume
-                print("[Scan] Resumed — target lost")
+            # Enable motors if needed
+            if not shared.motor_enabled:
+                serial.enable_motors()
+                shared.motor_enabled = True
 
-            if not shared.scan_paused and target is None:
-                # Enable motors if needed
-                if not shared.motor_enabled:
-                    serial.enable_motors()
-                    shared.motor_enabled = True
+            # One-time init
+            if not _scan_initialized:
+                _scan_initialized = True
+                _scan_pan_deg = -config.SCAN_PAN_RANGE  # start at far left
+                _scan_pan_dir = 1.0
+                _scan_people_seen = {}
+                _scan_embed_count = 0
+                print(f"[Scan] Data collection started — sweeping ±{config.SCAN_PAN_RANGE:.0f}° "
+                      f"over {config.SCAN_DURATION:.0f}s")
 
-                # One-time init
-                if not _scan_initialized:
-                    _scan_initialized = True
-                    _scan_pan_deg = 0.0
-                    _scan_tilt_deg = -config.SCAN_TILT_RANGE  # start at top
-                    _scan_pan_dir = 1.0
+            # Advance pan position
+            dt_scan = 1.0 / max(1.0, fps_loop.get())
+            _scan_pan_deg += _scan_pan_dir * config.SCAN_PAN_SPEED * dt_scan
 
-                # Advance scan position by time step
-                dt_scan = 1.0 / max(1.0, fps_loop.get())
-                _scan_pan_deg += _scan_pan_dir * config.SCAN_PAN_SPEED * dt_scan
-
-                # Check pan bounds — reverse and start tilt step
-                if _scan_pan_deg > config.SCAN_PAN_RANGE:
-                    _scan_pan_deg = config.SCAN_PAN_RANGE
-                    _scan_pan_dir = -1.0
-                    _scan_tilt_deg += config.SCAN_TILT_STEP
-                    _scan_tilt_stepping = True
-                    _scan_tilt_step_start = 0.0
-                elif _scan_pan_deg < -config.SCAN_PAN_RANGE:
-                    _scan_pan_deg = -config.SCAN_PAN_RANGE
-                    _scan_pan_dir = 1.0
-                    _scan_tilt_deg += config.SCAN_TILT_STEP
-                    _scan_tilt_stepping = True
-                    _scan_tilt_step_start = 0.0
-
-                # Check tilt bounds — wrap back to top
-                if _scan_tilt_deg > config.SCAN_TILT_RANGE:
-                    _scan_tilt_deg = -config.SCAN_TILT_RANGE
-
-                # Direct velocity output — no serial queries needed
-                if _scan_tilt_stepping:
-                    # Tilt step in progress: drive tilt, pause pan
-                    pan_vel = 0.0
-                    tilt_vel = config.SCAN_PAN_SPEED * 0.8  # step down at 80% of pan speed
-                    _scan_tilt_step_start += tilt_vel * dt_scan
-                    if _scan_tilt_step_start >= config.SCAN_TILT_STEP:
-                        _scan_tilt_stepping = False
-                        _scan_tilt_step_start = 0.0
+            # Check pan bounds — reverse direction
+            _scan_complete = False
+            if _scan_pan_deg > config.SCAN_PAN_RANGE:
+                _scan_pan_deg = config.SCAN_PAN_RANGE
+                if _scan_pan_dir > 0:
+                    _scan_pan_dir = -1.0  # start return sweep
                 else:
-                    # Normal pan sweep
-                    pan_vel = _scan_pan_dir * config.SCAN_PAN_SPEED
-                    tilt_vel = 0.0
+                    _scan_complete = True
+            elif _scan_pan_deg < -config.SCAN_PAN_RANGE:
+                _scan_pan_deg = -config.SCAN_PAN_RANGE
+                if _scan_pan_dir < 0:
+                    _scan_pan_dir = 1.0  # start return sweep
+                else:
+                    _scan_complete = True
+
+            # Collect ReID embeddings from ALL visible people (not just target)
+            if reid is not None and reid.ready:
+                for t in tracks:
+                    bbox = (int(t.x1), int(t.y1), int(t.x2), int(t.y2))
+                    emb = reid.compute_embedding(frame, bbox)
+                    if emb is not None:
+                        if t.track_id not in _scan_people_seen:
+                            # New ByteTrack ID — register with ReID
+                            gid = reid.register(t.track_id, emb)
+                            _scan_people_seen[t.track_id] = gid
+                            t.global_id = gid
+                        else:
+                            # Already seen — update their embedding
+                            gid = _scan_people_seen[t.track_id]
+                            reid.update(gid, emb)
+                            t.global_id = gid
+                        _scan_embed_count += 1
+
+            # Drive pan, no tilt
+            pan_vel = _scan_pan_dir * config.SCAN_PAN_SPEED
+            tilt_vel = 0.0
+
+            # Suppress normal target selection during scan
+            target = None
+
+            # Auto-stop after two sweeps (left→right→left)
+            if _scan_complete:
+                shared.scan_active = False
+                _scan_initialized = False
+                # Save all collected profiles
+                if reid is not None:
+                    reid._save_names()
+                n_people = len(set(_scan_people_seen.values()))
+                print(f"[Scan] Complete — {n_people} people profiled, "
+                      f"{_scan_embed_count} embeddings collected")
 
         # ── send velocity ──
         if shared.motor_enabled:
             serial.send_velocity(pan_vel, tilt_vel)
+
+        # ── Dynamic pipeline latency measurement ──
+        # Measure real time from frame capture to serial send.  Only update when
+        # a target was detected (idle frames skip most of the pipeline and would
+        # measure artificially low latency).
+        if target is not None and _frame_time > 0:
+            _serial_send_time = time.perf_counter()
+            _measured_pipe_sec = _serial_send_time - _frame_time
+            if _measured_pipe_sec > 0:
+                _pa = config.PIPELINE_LATENCY_EMA_ALPHA
+                _pipe_ema = _pa * _measured_pipe_sec + (1 - _pa) * _pipe_ema
 
         # ── fire zone: crosshair inside tracked person's bounding box ──
         _in_fire_zone = False
@@ -1098,7 +1183,8 @@ def _processing_thread(
         tilt_sps = (tilt_vel * config.TILT_GEAR_RATIO * config.STEPS_PER_REV * config.TILT_MICROSTEP_MULTIPLIER) / 360.0
 
         # ── PSL: feed raw frame (isolated thread does the heavy lifting) ──
-        psl.push_frame(frame)
+        if psl is not None:
+            psl.push_frame(frame)
 
         # ── push annotation job to background thread (off critical path) ──
         params = controller.get_params()
@@ -1160,6 +1246,11 @@ def _processing_thread(
                 _ann_job["pin12"] = {"label": "FIRE  [AUTO]", "colour": (0, 0, 220)}
         _annotation_queue.append(_ann_job)
 
+        # ── timing debug ──
+        if _cal_check_ctr % 120 == 0 and _cal_check_ctr > 0:
+            _t_total = (time.perf_counter() - _t_loop_start) * 1000
+            print(f"[Perf] loop={_t_total:.1f}ms  (target={1000/max(1,fps_loop.get()):.1f}ms)")
+
         # ── status for Flask UI ──
         with shared.status_lock:
             shared.status = {
@@ -1200,7 +1291,7 @@ def _processing_thread(
         _bl_vel_px_x = _ba * _pd_vx + (1 - _ba) * _bl_vel_px_x
         _bl_vel_px_y = _ba * _pd_vy + (1 - _ba) * _bl_vel_px_y
         if config.BALLISTIC_LEAD_ENABLED and _bl_stable_cnt > 0 and _bl_stable_cnt % 30 == 0:
-            print(f"[BL-DBG] pv={pan_vel:.1f}d/s  pd_vx={_pd_vx:.0f}px/s  bl_vel={_bl_vel_px_x:.0f}  lead_px={_bl_lead_px_x * _bl_blend_factor:.0f}  dist={shared.est_distance_m:.1f}m  blend={_bl_blend_factor:.2f}")
+            print(f"[BL-DBG] pv={pan_vel:.1f}d/s  pd_vx={_pd_vx:.0f}px/s  bl_vel={_bl_vel_px_x:.0f}  lead_px={_bl_lead_px_x * _bl_blend_factor:.0f}  dist={shared.est_distance_m:.1f}m  blend={_bl_blend_factor:.2f}  pipe={_pipe_ema*1000:.0f}ms")
 
         fps_loop.tick()
 
@@ -1625,9 +1716,20 @@ def _display_loop(controller: MotionController, reid: "PersonReID | None" = None
         with shared.annotated_lock:
             frame = shared.annotated_frame
 
-        # Display = same frame that was passed to YOLO (with annotations overlaid)
+        # Display annotated frame, or raw camera feed while waiting for first annotation
         if frame is not None:
+            if getattr(config, "DEMO_MODE", False):
+                cv2.putText(frame, "DEMO MODE - NO TURRET", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cv2.imshow(_WINDOW, frame)
+        else:
+            with shared.frame_lock:
+                _raw = shared.latest_frame
+            if _raw is not None:
+                if getattr(config, "DEMO_MODE", False):
+                    cv2.putText(_raw, "DEMO MODE - NO TURRET", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.imshow(_WINDOW, _raw)
         cv2.imshow(_CTRL_WINDOW, _ctrl_img)  # keep legend visible
         if shared.waypoint_mode:
             cv2.imshow(_WP_WINDOW, _draw_wp_panel(len(shared.waypoints_world), shared.waypoint_executing, shared.cal_active, shared.cal_click_px is not None))
@@ -1921,31 +2023,29 @@ def _display_loop(controller: MotionController, reid: "PersonReID | None" = None
             else:
                 print("[Display] I key: no serial connection.")
         elif _key_down and (key == ord('l') or key == ord('L')):
-            # One-button calibration: point away from you (center), press L
-            # Pan: ±2662 steps (±110°), Tilt: +978 upper, -2898 lower
+            # One-button calibration — run on background thread to avoid display freeze
             if _serial and _serial.connected:
-                if _serial.calibrate_from_center(2662, -2662, 978, -2898):
-                    shared.tilt_upper_calibrated = True
-                    shared.tilt_lower_calibrated = True
-                    shared.limits_calibrated = True
-                    # Store offsets so processing thread can re-send after Arduino reset
-                    shared.cal_pan_upper  = 2662
-                    shared.cal_pan_lower  = -2662
-                    shared.cal_tilt_upper = 978
-                    shared.cal_tilt_lower = -2898
-                    print("[Display] All limits set from center — Pan: ±2662 (±110°), Tilt: +978/-2898")
-                else:
-                    print("[Display] Calibration from center failed (no reply).")
+                def _do_calibrate():
+                    if _serial.calibrate_from_center(2662, -2662, 978, -2898):
+                        shared.tilt_upper_calibrated = True
+                        shared.tilt_lower_calibrated = True
+                        shared.limits_calibrated = True
+                        shared.cal_pan_upper  = 2662
+                        shared.cal_pan_lower  = -2662
+                        shared.cal_tilt_upper = 978
+                        shared.cal_tilt_lower = -2898
+                        print("[Display] All limits set from center — Pan: ±2662 (±110°), Tilt: +978/-2898")
+                    else:
+                        print("[Display] Calibration from center failed (no reply).")
+                threading.Thread(target=_do_calibrate, daemon=True).start()
             else:
                 print("[Display] L key: no serial connection.")
         elif _key_down and (key == ord('g') or key == ord('G')):
             shared.scan_active = not shared.scan_active
             if shared.scan_active:
-                shared.scan_paused = False
-                print("[Display] Scan mode ON — serpentine sweep ±%.0f° pan, ±%.0f° tilt"
-                      % (config.SCAN_PAN_RANGE, config.SCAN_TILT_RANGE))
+                print("[Display] Scan mode ON — ReID data collection ±%.0f° pan"
+                      % config.SCAN_PAN_RANGE)
             else:
-                shared.scan_paused = False
                 print("[Display] Scan mode OFF")
         elif _key_down and (key == ord('u') or key == ord('U')):
             # Name the currently tracked person
@@ -2201,13 +2301,21 @@ def main():
 
     print("[Main] Pan-Tilt Tracker starting ...")
 
+    # ── demo mode ──
+    if getattr(config, "DEMO_MODE", False):
+        print("[Main] *** DEMO MODE — using laptop webcam, no turret ***")
+
     # ── serial ──
     _serial = SerialComm()
 
     # ── resolve camera indices ──
     internal_cam_index = None
     narrow_cam_index = None
-    if config.CAMERA_INDEX == "auto_external":
+    if getattr(config, "DEMO_MODE", False):
+        # Demo mode: use built-in webcam (index 0) instead of external camera
+        cam_index = 0
+        print(f"[Main] DEMO: Using internal webcam (index {cam_index})")
+    elif config.CAMERA_INDEX == "auto_external":
         try:
             cam_index, internal_cam_index, narrow_cam_index = _find_cameras()
         except RuntimeError as exc:
@@ -2218,14 +2326,21 @@ def main():
         print(f"[Main] Using camera index {cam_index} (from config).")
 
     # ── open camera ──
-    _camera = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-    _camera.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAMERA_WIDTH)
-    _camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-    _camera.set(cv2.CAP_PROP_FPS,          config.CAMERA_FPS)
-    _camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    if getattr(config, "DEMO_MODE", False):
+        # Demo mode: open internal webcam with default backend (more compatible)
+        _camera = cv2.VideoCapture(cam_index)
+        _camera.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAMERA_WIDTH)
+        _camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+        _camera.set(cv2.CAP_PROP_FPS, 30)  # internal webcams typically 30fps
+    else:
+        _camera = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
+        _camera.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAMERA_WIDTH)
+        _camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
+        _camera.set(cv2.CAP_PROP_FPS,          config.CAMERA_FPS)
+        _camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
     # Hardware auto-exposure (DirectShow: 0.75 = auto, 0.25 = manual)
-    if config.CAMERA_AUTO_EXPOSURE:
+    if config.CAMERA_AUTO_EXPOSURE and not getattr(config, "DEMO_MODE", False):
         _camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75)
         print("[Main] Hardware auto-exposure requested (driver may ignore).")
 
@@ -2238,30 +2353,23 @@ def main():
     actual_fps = _camera.get(cv2.CAP_PROP_FPS)
     print(f"[Main] Wide camera opened (index {cam_index}): {actual_w}×{actual_h} @ {actual_fps:.0f}fps")
 
-    # ── open narrow/IR camera (Logitech C270) if found ──
+    # ── narrow/IR camera (Logitech C270) — detected but NOT opened yet ──
+    # Will be opened on-demand when camera switching logic requests it,
+    # to avoid USB bandwidth contention with the main camera.
     _narrow_camera = None
     if narrow_cam_index is not None:
-        _narrow_camera = cv2.VideoCapture(narrow_cam_index, cv2.CAP_DSHOW)
-        _narrow_camera.set(cv2.CAP_PROP_FRAME_WIDTH,  config.CAMERA_WIDTH)
-        _narrow_camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.CAMERA_HEIGHT)
-        _narrow_camera.set(cv2.CAP_PROP_FPS,          30)
-        _narrow_camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        if _narrow_camera.isOpened():
-            _nw = int(_narrow_camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-            _nh = int(_narrow_camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            print(f"[Main] Narrow/IR camera opened (index {narrow_cam_index}): {_nw}×{_nh}")
-            shared.narrow_cam_available = True
-        else:
-            print(f"[Main] WARNING: Could not open narrow camera index {narrow_cam_index}")
-            _narrow_camera = None
+        shared.narrow_cam_available = True
+        shared.narrow_cam_index = narrow_cam_index
+        print(f"[Main] Narrow/IR camera detected (index {narrow_cam_index}) — will open on demand")
 
     # ── subsystems ──
     tracker    = Tracker()
     controller = MotionController()
-    psl        = PSLAnalyzer()
+    psl        = PSLAnalyzer() if getattr(config, "PSL_ENABLED", True) else None
     reid       = PersonReID()
     reid.start()  # loads OSNet in background
-    psl.start()
+    if psl is not None:
+        psl.start()
     _hand_head.set_camera_index(internal_cam_index, exclude=cam_index)
     _hand_head.start()
 
@@ -2282,15 +2390,7 @@ def main():
     )
     cap_thread.start()
 
-    # ── Narrow/IR camera capture thread ──
-    if _narrow_camera is not None:
-        narrow_thread = threading.Thread(
-            target=_narrow_capture_thread,
-            args=(_narrow_camera,),
-            daemon=True,
-            name="NarrowCapture",
-        )
-        narrow_thread.start()
+    # Narrow camera thread will be started on-demand by the processing thread
 
     # ── Wait for first frame ──
     print("[Main] Waiting for first frame ...")

@@ -2,6 +2,16 @@
 #  config.py — All tunable parameters for the pan-tilt tracker
 # =============================================================
 
+# --------------- PSL facial analysis ---------------
+# Set False to skip MediaPipe FaceLandmarker entirely (saves CPU/GPU compute).
+PSL_ENABLED = False
+
+# --------------- Demo mode ---------------
+# Set True to run without the turret/external camera connected.
+# Uses the laptop's built-in webcam instead of the SVPRO external camera,
+# and serial runs in simulation mode (no Arduino needed).
+DEMO_MODE = True
+
 # --------------- Camera ---------------
 # "auto_external" = scan for the first non-built-in USB camera (recommended).
 # Set to an integer (0, 1, 2 ...) to pin a specific index and skip detection.
@@ -191,13 +201,17 @@ DART_MASS_KG             = 0.0002  # 0.2 grams
 DART_DIAMETER_M          = 0.008   # 8mm sphere model
 DART_CD                  = 0.47    # drag coefficient (sphere)
 AIR_DENSITY              = 1.225   # kg/m³ at sea level
-BALLISTIC_VEL_ALPHA      = 0.08    # very slow EMA for lead velocity (lower = more stable, less jitter)
-BALLISTIC_BLEND_TIME     = 0.20    # seconds to ramp lead in/out (prevents jerk)
-BALLISTIC_MIN_STABILITY  = 15      # frames of stable velocity before lead activates
-BALLISTIC_MAX_LEAD_PX    = 120     # max lead offset in pixels (safety clamp)
+BALLISTIC_VEL_ALPHA      = 0.20    # EMA for lead velocity (was 0.08; converges in ~400ms now)
+BALLISTIC_BLEND_TIME     = 0.15    # seconds to ramp lead in/out (prevents jerk)
+BALLISTIC_MIN_STABILITY  = 10      # frames of stable velocity before lead activates (was 15)
+BALLISTIC_MAX_LEAD_PX    = 160     # max lead offset in pixels (raised from 120 to accommodate pipeline time)
+BALLISTIC_MAX_LEAD_SEC   = 0.50    # max total lead horizon (flight + pipe) in seconds — prevents runaway
 BALLISTIC_GRAVITY_COMP   = True    # compensate for dart drop (tilt up slightly)
 BALLISTIC_DRAG_MODEL     = True    # use drag deceleration model (more accurate flight time)
 BALLISTIC_SHOW_RETICLE   = True    # draw lead reticle on HUD
+# Dynamic pipeline latency measurement (Fix 2)
+PIPELINE_LATENCY_EMA_ALPHA = 0.15  # smoothing for measured pipeline latency (~7 frame window)
+PIPELINE_ARDUINO_OFFSET_MS = 10    # fixed offset for Arduino-side delay (serial parse + accel ramp start)
 
 # --------------- Auto-brightness ---------------
 # Hardware: ask the camera driver to manage exposure automatically.
@@ -237,12 +251,10 @@ HAND_CONTROL_EMA        = 0.5    # smoothing on hand/head position (0–1, highe
 HAND_CONTROL_CAM_INDEX  = 0      # built-in webcam index (0 = first/internal camera)
 HAND_CONTROL_FPS        = 15     # detection rate limit (Hz)
 
-# --------------- Scan mode ---------------
-# Serpentine scan pattern: sweeps pan left/right, steps tilt down each row.
-# Activates with G key. Auto-pauses when a target is detected, resumes when lost.
-SCAN_PAN_RANGE     = 15.0    # ±degrees from center for pan sweep
-SCAN_TILT_RANGE    = 15.0    # ±degrees from center for tilt sweep
-SCAN_PAN_SPEED     = 15.0    # deg/sec for pan sweep — slow, deliberate search
-SCAN_TILT_STEP     = 2.0     # degrees to step down in tilt after each pan sweep
-SCAN_PAUSE_ON_TARGET = True  # auto-pause scan when a target is detected
-SCAN_RESUME_ON_LOST  = True  # auto-resume scan when target is lost
+# --------------- Scan mode (ReID data collection) ---------------
+# Pans 120° over 15 seconds to collect appearance embeddings from all visible
+# people.  Does NOT lock on or fire — purely observational.  Profiles are
+# saved to person_names.json so they persist across runs.  Toggle with G key.
+SCAN_PAN_RANGE     = 60.0    # total sweep = ±60° = 120° arc
+SCAN_DURATION      = 15.0    # seconds for one full left→right sweep
+SCAN_PAN_SPEED     = 120.0 / 15.0  # deg/sec (derived, 8 deg/s)

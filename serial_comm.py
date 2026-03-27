@@ -110,10 +110,11 @@ class SerialComm:
                 print(f"[SerialComm] Write error: {exc}")
                 self._connected = False
 
-    def _wait_reply(self, expected: bytes, timeout: float = 1.0) -> bool:
+    def _wait_reply(self, expected: bytes, timeout: float = 0.3) -> bool:
         """
         Block until expected reply arrives or timeout.
         Must be called with lock held.
+        Default timeout reduced to 0.3s to prevent display freezes.
         """
         if not (self._ser and self._connected):
             return False
